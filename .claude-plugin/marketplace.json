@@ -1,0 +1,13 @@
+{
+  "name": "bomze-mods",
+  "description": "Моды Claude Code от Denis Malimonov",
+  "owner": {
+    "name": "Denis Malimonov"
+  },
+  "plugins": [
+    {
+      "name": "editable-diff",
+      "source": "./"
+    }
+  ]
+}

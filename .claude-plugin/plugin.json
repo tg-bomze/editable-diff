@@ -1,0 +1,7 @@
+{
+  "name": "editable-diff",
+  "version": "0.1.0",
+  "description": "Панель с правками Claude: зелёный/красный diff с контекстом, правка прямо в панели и сохранение в файл",
+  "author": { "name": "Denis Malimonov" },
+  "types": "./types/index.d.ts"
+}

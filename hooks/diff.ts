@@ -108,7 +108,8 @@ export function countChanges(rows: readonly Row[]): { added: number; removed: nu
   return { added, removed }
 }
 
-const isWordChar = (c: string | undefined) => c !== undefined && /[\p{L}\p{N}_$]/u.test(c)
+/** A letter, digit, `_` or `$`: what a word is made of, for change marks and double-click. */
+export const isWordChar = (c: string | undefined) => c !== undefined && /[\p{L}\p{N}_$]/u.test(c)
 
 /**
  * The changed span inside each removed line paired with an added one (the

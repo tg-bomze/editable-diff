@@ -87,7 +87,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await claudeEdits($, 'two', 'TWO')
 
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Text', text: /^1 file changed/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Changes$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^src\/a\.ts$/ })).toBeDefined()
     expect((await ui.find({ type: 'Text', text: /^\+1 −1$/ }))?.text).toBeDefined()
     expect((await line(ui, /TWO/))?.bg).toBe(ADDED)
@@ -108,7 +108,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ type: 'Text', text: /unsaved/ })).toBeUndefined()
 
     await ui.press({ key: 'clear' })
-    expect(await ui.find({ type: 'Text', text: /No changed files/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /No changes yet/ })).toBeDefined()
     expect(disk.get(FILE)).toBe('oneX\nTWO\nthree\n')
 
     // After the clear, Claude's next edit brings the file back, against its text now.
@@ -177,7 +177,7 @@ test('a change made in another editor shows up, and undoing Claude there drops t
 
   touch(FILE, 'one\ntwo\n')
   await clock.advance(1000)
-  expect(await ui.find({ type: 'Text', text: /No changed files/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /No changes yet/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -210,7 +210,7 @@ test('Clear asks first when there are unsaved edits, and never touches the disk'
   await ui.press({ key: 'clear' })
   expect(await ui.find({ type: 'Text', text: /will be lost/ })).toBeDefined()
   await ui.press({ key: 'clear-yes' })
-  expect(await ui.find({ type: 'Text', text: /No changed files/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /No changes yet/ })).toBeDefined()
   expect(disk.get(FILE)).toBe('y\n')
   await ui.unmount()
 })
@@ -283,7 +283,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       },
     } as const
     const band = await $.ui.mount({ ...BAND, surface })
-    expect(await band.find({ type: 'Text', text: /Claude's edits: 1 file/ })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: /^● Claude's edits · 1 file$/ })).toBeDefined()
 
     // An unsaved edit in the pane: Clear asks first.
     const pane = await $.ui.mount({ ...PANE, surface })
@@ -296,7 +296,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     // Claude's next edit brings the band back.
     await claudeEdits($, 'y', 'z')
-    expect(await band.find({ type: 'Text', text: /Claude's edits: 1 file/ })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: /^● Claude's edits · 1 file$/ })).toBeDefined()
     await pane.unmount()
     await band.unmount()
   })
@@ -313,5 +313,29 @@ test('the desktop cursor is drawn on the row and column clicked', async ($, on) 
   const caret = await ui.find({ type: 'Box', key: 'caret', in: 'file-1' })
   expect(caret?.props.top).toBe(3)
   expect(caret?.props.left).toBe(8)
+  await ui.unmount()
+})
+
+test('long changed lines: the window stops short of the tree bounds, and Show next skips no line', async ($, on) => {
+  const line = (i: number) =>
+    `    const value${i} = await someFunction(argumentNumberOne, argumentNumberTwo, "string literal ${i}") // c`
+  const old = Array.from({ length: 200 }, (_, i) => line(i)).join('\n')
+  world(on, { [FILE]: `${old}\n` })
+  await claudeEdits($, old, old.replace(/value/g, 'VALUE'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.resize({ columns: 90, rows: 40, in: 'file-1' })
+
+  const shown = async () => (await lines(ui)).map(l => /(?:value|VALUE)(\d+) /.exec(l.text)?.[0]).filter(Boolean)
+  const before = await shown()
+  expect(await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })).toBeDefined()
+  const last = before[before.length - 1]!
+
+  const nextRow =
+    (await ui.findAll({ type: 'Box', in: 'file-1' })).filter(b => /^[lwg]\d+$/.test(b.key ?? '')).length - 1
+  expect(before.length).toBeGreaterThan(0)
+  await ui.pointer({ type: 'down', x: 10, y: nextRow, button: 'left', in: 'file-1' })
+  const after = await shown()
+  // The window moved on to the row right after the last one drawn: none skipped.
+  expect(after[0]).toBe(`value${Number(/\d+/.exec(last)![0]) + 1} `)
   await ui.unmount()
 })

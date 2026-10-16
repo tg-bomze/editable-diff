@@ -21,12 +21,14 @@ export type FilesProps = {
   rows: FileRow[]
   selected: string
   surface: string
+  isDark: boolean
 }
 
 /** Mutable, so the handlers set up on the first draw see the latest props. */
 type State = { box: { props: FilesProps; seq: number } }
 
 const STATUS_COLOR = { A: 'success', M: 'warning', D: 'error' } as const
+const STATUS_GROUND = { A: '#2ea04333', M: '#d2992633', D: '#f8514933' } as const
 
 const Files: ClientModule<FilesProps, State> = (props, surface) => {
   const { Box, Text } = surface.elements
@@ -55,6 +57,8 @@ const Files: ClientModule<FilesProps, State> = (props, surface) => {
   }
   box.props = props
 
+  const hover = props.isDark ? '#ffffff0d' : '#0000000a'
+
   return (
     <Box flexDirection="column" width="100%">
       {props.rows.map(row => {
@@ -66,17 +70,21 @@ const Files: ClientModule<FilesProps, State> = (props, surface) => {
             flexDirection="row"
             width="100%"
             justifyContent="space-between"
-            backgroundColor={isSelected && isApp ? '#388bfd33' : undefined}
-            hover={isSelected || !isApp ? undefined : { backgroundColor: '#8b949e1a' }}
+            backgroundColor={isSelected && isApp ? '#388bfd26' : undefined}
+            hover={isSelected || !isApp ? undefined : { backgroundColor: hover }}
           >
             <Text wrap="truncate-end" inverse={isSelected && !isApp}>
-              <Text color={STATUS_COLOR[row.status]}> {row.status} </Text>
+              <Text color="suggestion">{isSelected ? '▎' : ' '}</Text>
               <Text weight={isSelected ? 'semibold' : undefined}>{row.name}</Text>
               {row.dir ? <Text dimColor> {row.dir}</Text> : ''}
             </Text>
             <Text tabular wrap="truncate-start">
               {row.isDirty ? <Text color="warning">● </Text> : ''}
               <Text color="success">+{row.added}</Text> <Text color="error">−{row.removed}</Text>{' '}
+              <Text color={STATUS_COLOR[row.status]} backgroundColor={isApp ? STATUS_GROUND[row.status] : undefined}>
+                {' '}
+                {row.status}{' '}
+              </Text>
             </Text>
           </Box>
         )

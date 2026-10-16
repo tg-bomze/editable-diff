@@ -11,7 +11,16 @@
 import type { ClientKeyEvent, ClientModule, ClientPointerEvent, ClientSurface, Color } from 'claude-code'
 
 import type { EditorPost } from '../types'
-import { applyPatch, countChanges, diffLines, fingerprint, splitLines, visibleRows, wordRanges } from './diff'
+import {
+  applyPatch,
+  countChanges,
+  diffLines,
+  fingerprint,
+  isWordChar,
+  splitLines,
+  visibleRows,
+  wordRanges,
+} from './diff'
 import type { Patch, Row } from './diff'
 import { lineStates, tokenize } from './highlight'
 import type { LineState, TokenKind } from './highlight'
@@ -43,7 +52,7 @@ export type EditorProps = {
 type Pos = { row: number; col: number }
 
 type Item =
-  | { kind: 'line'; k: number; from: number; to: number; first: boolean; last: boolean }
+  | { kind: 'line'; k: number; v: number; from: number; to: number; first: boolean; last: boolean }
   | { kind: 'gap'; from: number; to: number; header: string }
   | { kind: 'prev' | 'next'; count: number }
 
@@ -70,6 +79,10 @@ type Model = {
   opened: Set<number>
   /** The window's first row, as an index into the rows shown. */
   win: number
+  /** How many rows shown the last drawing fit in the window: WINDOW, or fewer when they ran past MAX_CHARS. */
+  span: number
+  /** How many rows are shown in all, for the window's last row. */
+  shown: number
   /** Keep the cursor inside the window (after keys); off once the person moves the window. */
   isFollowing: boolean
   undo: Snap[]
@@ -94,8 +107,8 @@ const TAB = 4
 const UNDO = 300
 const WINDOW = 100
 const STEP = 50
-/** The tree stays under the element bounds (100,000 characters serialized). */
-const MAX_CHARS = 60_000
+/** What the rows may serialize to, under the element bounds (100,000 characters) with room for the rest. */
+const MAX_CHARS = 90_000
 const SPECIAL = new Set(
   'up down left right home end pageup pagedown return enter backspace delete tab space escape insert clear f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12'.split(
     ' ',
@@ -389,7 +402,7 @@ function layout(m: Model): void {
   if (m.isFollowing && cursorK >= 0) {
     const at = visible.indexOf(cursorK)
     if (at >= 0 && at < m.win) m.win = Math.max(0, at - 10)
-    else if (at >= m.win + WINDOW) m.win = at - WINDOW + 10
+    else if (at >= m.win + m.span) m.win = Math.max(0, at - Math.max(1, m.span - 10))
   }
   m.win = Math.max(0, Math.min(m.win, visible.length - WINDOW))
 
@@ -400,25 +413,27 @@ function layout(m: Model): void {
   const items: Item[] = []
   if (m.win > 0) items.push({ kind: 'prev', count: m.win })
   let last = m.win > 0 ? visible[m.win - 1]! : -1
-  let budget = MAX_CHARS
   let end = m.win
-  for (; end < visible.length && end < m.win + WINDOW && budget > 0; end++) {
+  for (; end < visible.length && end < m.win + WINDOW; end++) {
     const k = visible[end]!
     if (k > last + 1) items.push({ kind: 'gap', from: last + 1, to: k, header: hunkHeader(rows, visible, end) })
     const text = rows[k]!.text
     const starts = wrapAt(measure(text).x, width)
     starts.forEach((from, n) => {
       const to = n + 1 < starts.length ? starts[n + 1]! : text.length
-      items.push({ kind: 'line', k, from, to, first: n === 0, last: n === starts.length - 1 })
+      items.push({ kind: 'line', k, v: end, from, to, first: n === 0, last: n === starts.length - 1 })
     })
-    budget -= text.length * 2 + 400 * starts.length
     last = k
   }
   if (end < visible.length) items.push({ kind: 'next', count: visible.length - end })
   else if (last >= 0 && last < rows.length - 1) items.push({ kind: 'gap', from: last + 1, to: rows.length, header: '' })
   if (visible.length === 0 && rows.length > 0) items.push({ kind: 'gap', from: 0, to: rows.length, header: '' })
   m.items = items
+  m.shown = visible.length
 }
+
+/** How far "Show next" and the cursor move the window: STEP, or what the last drawing fit. */
+const stepOf = (m: Model, dir: 1 | -1) => (dir > 0 ? Math.max(1, Math.min(STEP, m.span)) : -STEP)
 
 /** The region row the cursor is on, and its cell column there. */
 function cursorAt(m: Model): { index: number; x: number } {
@@ -470,7 +485,7 @@ function vertical(m: Model, dir: 1 | -1, times = 1): void {
       // Move the window on and look again from where the cursor is.
       const p = target ?? m.cur
       m.cur = p
-      m.win += dir * STEP
+      m.win += stepOf(m, dir)
       m.isFollowing = false
       layout(m)
       index = cursorAt(m).index
@@ -486,15 +501,20 @@ function vertical(m: Model, dir: 1 | -1, times = 1): void {
   m.goalX = goal
 }
 
-const isWord = (ch: string | undefined) => ch !== undefined && /[\p{L}\p{N}_$]/u.test(ch)
+/** Home as editors do it: to the first non-blank, or to column 0 when already there. */
+function homeOf(line: string, col: number): number {
+  const first = /^[ \t]*/.exec(line)![0].length
+
+  return col === first ? 0 : first
+}
 
 function wordAround(m: Model, p: Pos): [Pos, Pos] {
   const line = m.lines[p.row]!
   let a = p.col
   let b = p.col
-  if (isWord(line[a]) || isWord(line[a - 1])) {
-    while (a > 0 && isWord(line[a - 1])) a--
-    while (b < line.length && isWord(line[b])) b++
+  if (isWordChar(line[a]) || isWordChar(line[a - 1])) {
+    while (a > 0 && isWordChar(line[a - 1])) a--
+    while (b < line.length && isWordChar(line[b])) b++
   } else if (b < line.length) {
     b++
   }
@@ -576,8 +596,7 @@ function onKey(m: Model, ev: ClientKeyEvent): void {
       post(m)
     }
   } else if (mod && (k === 'left' || k === 'home')) {
-    const first = /^[ \t]*/.exec(line)![0].length
-    moveTo({ row: m.cur.row, col: m.cur.col === first ? 0 : first })
+    moveTo({ row: m.cur.row, col: homeOf(line, m.cur.col) })
   } else if (mod && (k === 'right' || k === 'end')) {
     moveTo({ row: m.cur.row, col: line.length })
   } else if (mod && k === 'up') {
@@ -604,8 +623,7 @@ function onKey(m: Model, ev: ClientKeyEvent): void {
     else if (m.cur.col < line.length) moveTo({ row: m.cur.row, col: m.cur.col + 1 })
     else if (m.cur.row < m.lines.length - 1) moveTo({ row: m.cur.row + 1, col: 0 })
   } else if (k === 'home') {
-    const first = /^[ \t]*/.exec(line)![0].length
-    moveTo({ row: m.cur.row, col: m.cur.col === first ? 0 : first })
+    moveTo({ row: m.cur.row, col: homeOf(line, m.cur.col) })
   } else if (k === 'end') {
     moveTo({ row: m.cur.row, col: line.length })
   } else if (k === 'return' || k === 'enter') {
@@ -683,7 +701,7 @@ function onPointer(m: Model, ev: ClientPointerEvent): void {
     return
   }
   if (item?.kind === 'prev' || item?.kind === 'next') {
-    m.win += item.kind === 'next' ? STEP : -STEP
+    m.win += stepOf(m, item.kind === 'next' ? 1 : -1)
     m.isFollowing = false
     redraw(m)
     return
@@ -741,6 +759,8 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
       version: 0,
       opened: new Set(),
       win: 0,
+      span: WINDOW,
+      shown: 0,
       isFollowing: false,
       undo: [],
       redo: [],
@@ -783,6 +803,8 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
     ? { ...TERMINAL, syntax: props.isDark ? DARK_SYNTAX : LIGHT_SYNTAX }
     : { ...APP, syntax: props.isDark ? DARK_SYNTAX : LIGHT_SYNTAX }
   const { rows, words, states } = diffOf(m)
+  const ctxGutter = isTerminal ? undefined : props.isDark ? '#ffffff08' : '#00000008'
+  const hunkText = isTerminal ? 'suggestion' : props.isDark ? '#79c0ff' : '#0969da'
   const showCursor = m.isActive && props.isFocused
   const sel = showCursor ? selection(m) : null
   const numW = m.numW
@@ -852,10 +874,12 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
 
     return (
       <Box key={`l${n}`} flexDirection="row" width="100%" backgroundColor={lineBg}>
-        <Text mono wrap="truncate-end">
-          <Text mono dimColor backgroundColor={gutterBg}>
+        <Box width={numW * 2 + 2} flexShrink={0} backgroundColor={gutterBg ?? ctxGutter}>
+          <Text mono dimColor>
             {pad(oldNo, numW)} {pad(newNo, numW)}{' '}
           </Text>
+        </Box>
+        <Text mono wrap="truncate-end">
           <Text mono color={row.kind === 'add' ? 'success' : row.kind === 'del' ? 'error' : undefined}>
             {' '}
             {marker}{' '}
@@ -873,7 +897,7 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
   const { added, removed } = countChanges(rows)
   // Set while the rows are drawn; placed against the region, one row per item.
   let caret: { top: number; left: number } | null = null
-  const drawn = m.items.map((item, n) => {
+  const drawItem = (item: Item, n: number) => {
     if (item.kind === 'line') return drawLine(item, n)
     if (item.kind !== 'gap') {
       const label =
@@ -883,7 +907,7 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
 
       return (
         <Box key={`w${n}`} flexDirection="row" width="100%" backgroundColor={palette.hunk}>
-          <Text mono color="suggestion" wrap="truncate-end">
+          <Text mono color={hunkText} wrap="truncate-end">
             {' '.repeat(m!.gutter - 2)}
             {label}
           </Text>
@@ -898,15 +922,48 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
 
     return (
       <Box key={`g${n}`} flexDirection="row" width="100%" backgroundColor={palette.hunk}>
-        <Text mono dimColor wrap="truncate-end">
-          {pad('↕', numW * 2 + 1)}
-          {'   '}
-          {item.header ? `${item.header}   ` : ''}
-          {label}
+        <Text mono wrap="truncate-end">
+          <Text mono color={hunkText}>
+            {pad('⋯', numW * 2 + 1)}
+            {'   '}
+          </Text>
+          {item.header ? (
+            <Text mono color={hunkText}>
+              {item.header}
+            </Text>
+          ) : (
+            ''
+          )}
+          <Text dimColor>
+            {item.header ? '  ' : ''}
+            {label}
+          </Text>
         </Text>
       </Box>
     )
-  })
+  }
+
+  // Draw rows until they would serialize past MAX_CHARS; the rest of the window waits behind "Show next".
+  let drawn = m.items.map(drawItem)
+  let size = 0
+  const over = drawn.findIndex(
+    (el, n) => (size += JSON.stringify(el).length) > MAX_CHARS && m.items[n]!.kind === 'line',
+  )
+  m.span = WINDOW
+  if (over >= 0) {
+    const lineAt = (item: Item | undefined) => (item?.kind === 'line' ? item.v : -1)
+    const firstV = lineAt(m.items.find(item => item.kind === 'line'))
+    // The first row not drawn; the window's first row is always drawn, or it could never move on.
+    const stopV = Math.max(lineAt(m.items[over]), firstV + 1)
+    let cut = m.items.findIndex(item => lineAt(item) >= stopV)
+    if (cut < 0) cut = m.items.length
+    else if (m.items[cut - 1]?.kind === 'gap') cut--
+    const next: Item = { kind: 'next', count: m.shown - stopV }
+    m.items = [...m.items.slice(0, cut), ...(next.count > 0 ? [next] : [])]
+    m.span = stopV - firstV
+    caret = null
+    drawn = m.items.map(drawItem)
+  }
   const bar = caret as { top: number; left: number } | null
 
   return (

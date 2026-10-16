@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { Color, EngineInterface, Register } from 'claude-code'
 
 import type { Drafts, EditorPost, FilesPost, TrackedFile } from '../types'
 import { countChanges, diffLines, fingerprint, makePatch, splitLines } from './diff'
@@ -50,7 +50,7 @@ function splitPath(display: string): { name: string; dir: string } {
   return at < 0 ? { name: display, dir: '' } : { name: display.slice(at + 1), dir: display.slice(0, at) }
 }
 
-const files_ = (n: number) => `${n} ${n === 1 ? 'file' : 'files'}`
+const fileCount = (n: number) => `${n} ${n === 1 ? 'file' : 'files'}`
 
 function isSelect(data: unknown): data is FilesPost {
   return typeof data === 'object' && data !== null && typeof (data as Record<string, unknown>).select === 'string'
@@ -103,6 +103,10 @@ async function openPane($: EngineInterface) {
 
 const patchFile = ($: EngineInterface, path: string, fn: (f: TrackedFile) => TrackedFile) =>
   update($, files, list => list.map(f => (f.path === path ? fn(f) : f)))
+
+/** Makes the file's editor take its text afresh: the draft if one is left, else the disk. */
+const reload = ($: EngineInterface, path: string) =>
+  patchFile($, path, f => ({ ...f, rev: f.rev + 1, conflict: false }))
 
 // Claude's edits: remember the text before the first one, refresh after each.
 async function track(
@@ -331,7 +335,7 @@ export const register: Register = on => {
     if (await read($, isConfirmingClear)) {
       return (
         <Box flexDirection="row" gap={1} alignItems="center">
-          <Text color="warning">Unsaved edits in {files_(dirty)} will be lost. Files on disk stay as they are.</Text>
+          <Text color="warning">Unsaved edits in {fileCount(dirty)} will be lost. Files on disk stay as they are.</Text>
           <Button key="band-clear-yes" label="Clear" variant="primary" onPress={() => clearAll($)} />
           <Button key="band-clear-no" label="Cancel" onPress={() => update($, isConfirmingClear, () => false)} />
         </Box>
@@ -340,12 +344,13 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="row" gap={1} alignItems="center">
-        <Text dimColor>
-          Claude's edits: {files_(list.length)}
+        <Text>
+          <Text color="claude">●</Text> <Text weight="semibold">Claude's edits</Text>
+          <Text dimColor> · {fileCount(list.length)}</Text>
           {dirty > 0 ? <Text color="warning"> · {dirty} unsaved</Text> : ''}
         </Text>
-        <Button key="open-pane" label="Open panel" dimColor onPress={() => void openPane($)} />
-        <Button key="band-clear" label="Clear" dimColor onPress={() => askClear($)} />
+        <Button key="open-pane" label="Open panel" variant="secondary" onPress={() => void openPane($)} />
+        <Button key="band-clear" label="Clear" variant="secondary" onPress={() => askClear($)} />
       </Box>
     )
   })
@@ -364,13 +369,13 @@ export const register: Register = on => {
     }
     const discard = (path: string) => async () => {
       await update($, drafts, d => without(d, path))
-      await patchFile($, path, f => ({ ...f, rev: f.rev + 1, conflict: false }))
+      await reload($, path)
     }
     const revert = (path: string) => async () => {
       const f = (await read($, files)).find(x => x.path === path)
       if (!f) return
       await update($, drafts, d => (f.base === f.disk ? without(d, path) : { ...d, [path]: f.base }))
-      await patchFile($, path, x => ({ ...x, rev: x.rev + 1, conflict: false }))
+      await reload($, path)
     }
     const remove = (path: string) => async () => {
       await update($, files, l => l.filter(f => f.path !== path))
@@ -381,38 +386,59 @@ export const register: Register = on => {
     const { Box, Text, Button } = elements
     // The surfaces that run a surface module; another gets the list and the buttons alone.
     const Client = 'Client' in elements ? elements.Client : undefined
+    const isApp = e.surface !== 'terminal'
+    const tint = {
+      neutral: isDark ? '#ffffff14' : '#0000000f',
+      warning: '#d2992626',
+    }
+
+    /** A short label on a tinted ground; in brackets on the terminal. */
+    const chip = (key: string, text: string, color?: Color, ground = tint.neutral) =>
+      isApp ? (
+        <Box key={key} backgroundColor={ground} paddingX={1}>
+          <Text color={color} tabular>
+            {text}
+          </Text>
+        </Box>
+      ) : (
+        <Text key={key} color={color} dimColor={!color}>
+          [{text}]
+        </Text>
+      )
+
+    if (!selected) {
+      return (
+        <Box flexDirection="column" alignItems="center" paddingY={2}>
+          <Text color="success">✓</Text>
+          <Text weight="semibold">No changes yet</Text>
+          <Text dimColor>Files Claude changes with Edit or Write will show up here.</Text>
+        </Box>
+      )
+    }
 
     const toolbar = (
       <Box flexDirection="row" alignItems="center" justifyContent="space-between" gap={1}>
-        <Text>
-          {list.length === 0 ? 'No changed files' : `${files_(list.length)} changed`}
-          {dirtyCount > 0 ? <Text color="warning"> · {dirtyCount} unsaved</Text> : ''}
-        </Text>
+        <Box flexDirection="row" alignItems="center" gap={1}>
+          <Text weight="semibold">Changes</Text>
+          {chip('count', String(list.length))}
+          {dirtyCount > 0 ? chip('unsaved', `● ${dirtyCount} unsaved`, 'warning', tint.warning) : null}
+        </Box>
         <Box flexDirection="row" gap={1}>
           {dirtyCount > 1 ? <Button key="save-all" label="Save all" variant="primary" onPress={saveAll} /> : null}
-          {list.length > 0 ? (
-            <Button key="clear" label="Clear" variant="secondary" onPress={() => askClear($)} />
-          ) : null}
+          <Button key="clear" label="Clear" variant="secondary" onPress={() => askClear($)} />
         </Box>
       </Box>
     )
 
     const confirm = confirming ? (
-      <Box flexDirection="row" alignItems="center" gap={1}>
-        <Text color="warning">Unsaved edits in {files_(dirtyCount)} will be lost. Files on disk stay as they are.</Text>
+      <Box flexDirection="row" alignItems="center" gap={1} marginTop={1}>
+        <Text color="warning">
+          Unsaved edits in {fileCount(dirtyCount)} will be lost. Files on disk stay as they are.
+        </Text>
         <Button key="clear-yes" label="Clear" variant="primary" onPress={() => clearAll($)} />
         <Button key="clear-no" label="Cancel" onPress={() => update($, isConfirmingClear, () => false)} />
       </Box>
     ) : null
-
-    if (!selected) {
-      return (
-        <Box flexDirection="column">
-          {toolbar}
-          <Text dimColor>Files Claude changes with Edit or Write will show up here.</Text>
-        </Box>
-      )
-    }
 
     const textOf = (f: TrackedFile) => unsaved[f.path] ?? f.disk
     const stats = new Map(list.map(f => [f.path, countChanges(diffLines(splitLines(f.base), splitLines(textOf(f))))]))
@@ -467,6 +493,18 @@ export const register: Register = on => {
     const { added, removed } = stats.get(f.path)!
     const { name, dir } = splitPath(f.display)
 
+    // GitHub's five squares: the share of added and removed lines.
+    const total = added + removed
+    const green = total ? Math.round((5 * added) / total) : 0
+    const red = total ? Math.min(5 - green, Math.round((5 * removed) / total)) : 0
+    const squares = (
+      <Text>
+        <Text color="success">{'■'.repeat(green)}</Text>
+        <Text color="error">{'■'.repeat(red)}</Text>
+        <Text dimColor>{'■'.repeat(5 - green - red)}</Text>
+      </Text>
+    )
+
     const header = (
       <Box flexDirection="row" alignItems="center" justifyContent="space-between" gap={1}>
         <Box flexDirection="row" alignItems="center" gap={1} flexShrink={1}>
@@ -474,11 +512,8 @@ export const register: Register = on => {
             {dir ? <Text dimColor>{dir}/</Text> : ''}
             <Text weight="semibold">{name}</Text>
           </Text>
-          <Text tabular>
-            <Text color="success">+{added}</Text> <Text color="error">−{removed}</Text>
-          </Text>
-          {f.isNew ? <Text dimColor>new</Text> : null}
-          {isDirty ? <Text color="warning">● unsaved</Text> : null}
+          {f.isNew ? chip('new', 'new', 'success') : null}
+          {isDirty ? chip('dirty', '● unsaved', 'warning', tint.warning) : null}
         </Box>
         <Box flexDirection="row" gap={1}>
           {isDirty ? <Button key={`discard-${f.id}`} label="Discard my edits" onPress={discard(f.path)} /> : null}
@@ -494,25 +529,33 @@ export const register: Register = on => {
     )
 
     const tools = (
-      <Box flexDirection="row" gap={1}>
-        <Button
-          key={`expand-${f.id}`}
-          label={f.isExpanded ? 'Changes only' : 'Whole file'}
-          variant="secondary"
-          onPress={() => patchFile($, f.path, x => ({ ...x, isExpanded: !x.isExpanded }))}
-        />
-        {f.base !== textOf(f) && !f.isNew ? (
-          <Button key={`revert-${f.id}`} label="Revert to original" variant="secondary" onPress={revert(f.path)} />
-        ) : null}
-        <Button key={`remove-${f.id}`} label="Remove from list" variant="secondary" onPress={remove(f.path)} />
+      <Box flexDirection="row" alignItems="center" justifyContent="space-between" gap={1}>
+        <Box flexDirection="row" alignItems="center" gap={1}>
+          <Text tabular>
+            <Text color="success">+{added}</Text> <Text color="error">−{removed}</Text>
+          </Text>
+          {squares}
+        </Box>
+        <Box flexDirection="row" gap={1}>
+          <Button
+            key={`expand-${f.id}`}
+            label={f.isExpanded ? 'Changes only' : 'Whole file'}
+            variant="secondary"
+            onPress={() => patchFile($, f.path, x => ({ ...x, isExpanded: !x.isExpanded }))}
+          />
+          {f.base !== textOf(f) && !f.isNew ? (
+            <Button key={`revert-${f.id}`} label="Revert to original" variant="secondary" onPress={revert(f.path)} />
+          ) : null}
+          <Button key={`remove-${f.id}`} label="Remove from list" variant="secondary" onPress={remove(f.path)} />
+        </Box>
       </Box>
     )
 
     const notices = (
       <>
         {f.conflict ? (
-          <Box flexDirection="row" alignItems="center" gap={1}>
-            <Text color="warning">The file changed on disk while you had unsaved edits.</Text>
+          <Box flexDirection="row" alignItems="center" gap={1} backgroundColor={isApp ? tint.warning : undefined}>
+            <Text color="warning"> The file changed on disk while you had unsaved edits.</Text>
             <Button key={`take-${f.id}`} label="Take the disk version" onPress={discard(f.path)} />
             <Button
               key={`keep-${f.id}`}
@@ -526,12 +569,21 @@ export const register: Register = on => {
     )
 
     const detail = (
-      <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+      <Box
+        key="detail"
+        flexDirection="column"
+        flexGrow={1}
+        flexShrink={1}
+        borderStyle="round"
+        borderColor="subtle"
+        paddingX={1}
+        gap={1}
+      >
         {header}
         {tools}
         {notices}
         {Client ? (
-          <Box flexDirection="column" borderStyle="round" borderColor="subtle" marginTop={1}>
+          <Box flexDirection="column">
             {list.filter(x => x === selected || unsaved[x.path] !== undefined).map(editor)}
           </Box>
         ) : null}
@@ -550,11 +602,16 @@ export const register: Register = on => {
           borderColor="subtle"
           width={isWide ? sideWidth : '100%'}
           flexShrink={0}
+          gap={1}
         >
+          <Text dimColor weight="semibold">
+            {' '}
+            CHANGED FILES
+          </Text>
           <Client
             key="files"
             module="./files.tsx"
-            props={{ rows, selected: f.path, surface: e.surface }}
+            props={{ rows, selected: f.path, surface: e.surface, isDark }}
             width="100%"
           />
         </Box>

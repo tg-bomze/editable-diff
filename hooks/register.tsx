@@ -9,9 +9,13 @@ import type {
   FileWindow,
   FilesPost,
   ReviewComment,
+  SavedFile,
+  SavedIndex,
+  SavedSession,
   TrackedFile,
 } from '../types'
 import { countChanges, diffLines, fingerprint, makePatch, printable, splitLines, unifiedDiff } from './diff'
+import { ROWS } from './files'
 import type { FileRow } from './files'
 import { languageOf } from './highlight'
 import { isTooLarge, shiftWindow, slices, spliceBack, windowAtChange, windowFor, windowKey } from './window'
@@ -26,6 +30,14 @@ const WINDOW_AT = MAX_PROPS - 5_000
 const POLL_MS = 1000
 /** How many polls between reads of git HEAD, while the diff is drawn against it. */
 const HEAD_POLLS = 5
+/** Every how many polls the list is saved to the store, when it changed. */
+const SAVE_POLLS = 2
+/** What the store may take of one session's list, and of all sessions' together, in characters of JSON. */
+const MAX_SAVED = 1_500_000
+const MAX_STORE = 3_500_000
+/** How many sessions' lists the store keeps; the oldest go first. */
+const MAX_SESSIONS = 20
+const INDEX = 'sessions'
 /** What an editor's rows may serialize to at first, and at least after the surface refused its drawings. */
 const BUDGET = 50_000
 const MIN_BUDGET = 5_000
@@ -57,6 +69,7 @@ const composing = atom({ plugin: 'editable-diff', key: 'composing' } as const, n
 const commands = atom({ plugin: 'editable-diff', key: 'commands' } as const, {})
 const budgets = atom({ plugin: 'editable-diff', key: 'budgets' } as const, {})
 const windows = atom({ plugin: 'editable-diff', key: 'windows' } as const, {})
+const listScroll = atom({ plugin: 'editable-diff', key: 'listScroll' } as const, null)
 
 const MODES: { mode: BaseMode; label: string; revert: string }[] = [
   { mode: 'session', label: 'Session start', revert: 'Revert to original' },
@@ -111,8 +124,12 @@ function splitPath(display: string): { name: string; dir: string } {
 const fileCount = (n: number) => `${n} ${n === 1 ? 'file' : 'files'}`
 const lineRange = (from: number, to: number) => (from === to ? `line ${from}` : `lines ${from}–${to}`)
 
-function isSelect(data: unknown): data is FilesPost {
+function isSelect(data: unknown): data is Extract<FilesPost, { select: string }> {
   return typeof data === 'object' && data !== null && typeof (data as Record<string, unknown>).select === 'string'
+}
+
+function isHover(data: unknown): data is Extract<FilesPost, { isOver: boolean }> {
+  return typeof data === 'object' && data !== null && typeof (data as Record<string, unknown>).isOver === 'boolean'
 }
 
 /** Whether the person's theme is a dark one; dark when it cannot be told. */
@@ -156,7 +173,13 @@ let cwd = ''
 /** Paths being written by a save right now: the poll leaves them alone. */
 const writing = new Set<string>()
 let isPolling = false
+/** The pointer is over the file list: the wheel scrolls the list, not the pane. */
+let isOverList = false
 let polls = 0
+/** The session's id, under which its list is saved. */
+let sessionId = ''
+/** The versions of the saved values when last saved, to save only on a change. */
+let savedStamp = ''
 /** The lines each editor last had under its cursor, for the Comment and Open buttons. */
 const selOf = new Map<string, [number, number]>()
 /** Starts anywhere, so a command after a reload is never mistaken for one an editor already did. */
@@ -436,9 +459,208 @@ async function poll($: EngineInterface): Promise<void> {
     }
     // A commit moves HEAD without touching the files.
     if (++polls % HEAD_POLLS === 0 && (await read($, baseMode)) === 'head') await refreshHeads($)
+    if (polls % SAVE_POLLS === 0) await persist($).catch(() => {})
   } finally {
     isPolling = false
   }
+}
+
+// Saving the list, so a resumed session finds it again.
+
+/** The versions of every value saved, as one string. */
+async function stamp($: EngineInterface): Promise<string> {
+  const all = await Promise.all([
+    $.state.get({ plugin: 'editable-diff', key: 'files' }),
+    $.state.get({ plugin: 'editable-diff', key: 'drafts' }),
+    $.state.get({ plugin: 'editable-diff', key: 'nextId' }),
+    $.state.get({ plugin: 'editable-diff', key: 'active' }),
+    $.state.get({ plugin: 'editable-diff', key: 'baseMode' }),
+    $.state.get({ plugin: 'editable-diff', key: 'turnId' }),
+    $.state.get({ plugin: 'editable-diff', key: 'isSplit' }),
+    $.state.get({ plugin: 'editable-diff', key: 'ignoreWhitespace' }),
+    $.state.get({ plugin: 'editable-diff', key: 'viewed' }),
+    $.state.get({ plugin: 'editable-diff', key: 'comments' }),
+  ])
+
+  return all.map(x => x.version).join(',')
+}
+
+/** A file as the store keeps it: its text on disk only as a fingerprint, the turn's base only when not the session's. */
+function toSaved(f: TrackedFile): SavedFile {
+  const { disk, head: _head, rev: _rev, conflict: _conflict, mtimeMs: _mtime, size: _size, ...rest } = f
+
+  return { ...rest, turnBase: f.turnBase === f.base ? undefined : f.turnBase, diskHash: fingerprint(disk) }
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStrings = (v: unknown): v is Record<string, string> =>
+  isRecord(v) && Object.values(v).every(x => typeof x === 'string')
+
+function asIndex(v: unknown): SavedIndex {
+  if (!isRecord(v)) return {}
+  const out: SavedIndex = {}
+  for (const [id, e] of Object.entries(v)) {
+    if (isRecord(e) && typeof e.savedAt === 'number' && typeof e.size === 'number') {
+      out[id] = { savedAt: e.savedAt, size: e.size }
+    }
+  }
+
+  return out
+}
+
+/** The store's value as a saved session, or undefined when it is not one: the store is a file anyone can edit. */
+function asSaved(v: unknown): SavedSession | undefined {
+  if (!isRecord(v) || v.version !== 1 || !Array.isArray(v.files)) return undefined
+  if (!isStrings(v.drafts) || !isStrings(v.viewed) || !Array.isArray(v.comments)) return undefined
+  const isFile = (f: unknown): f is SavedFile =>
+    isRecord(f) &&
+    typeof f.id === 'number' &&
+    typeof f.path === 'string' &&
+    f.path.startsWith('/') &&
+    typeof f.display === 'string' &&
+    typeof f.base === 'string' &&
+    typeof f.diskHash === 'string' &&
+    (f.turnBase === undefined || typeof f.turnBase === 'string')
+  const isComment = (c: unknown): c is ReviewComment =>
+    isRecord(c) &&
+    typeof c.id === 'number' &&
+    typeof c.path === 'string' &&
+    typeof c.display === 'string' &&
+    typeof c.from === 'number' &&
+    typeof c.to === 'number' &&
+    typeof c.quote === 'string' &&
+    typeof c.text === 'string'
+  const mode = MODES.some(m => m.mode === v.baseMode) ? (v.baseMode as BaseMode) : 'session'
+
+  return {
+    version: 1,
+    savedAt: typeof v.savedAt === 'number' ? v.savedAt : 0,
+    files: v.files.filter(isFile),
+    dropped: typeof v.dropped === 'number' ? v.dropped : 0,
+    drafts: v.drafts,
+    nextId: typeof v.nextId === 'number' ? v.nextId : 1,
+    active: typeof v.active === 'string' ? v.active : '',
+    baseMode: mode,
+    turnId: typeof v.turnId === 'string' ? v.turnId : '',
+    isSplit: v.isSplit === true,
+    ignoreWhitespace: v.ignoreWhitespace === true,
+    viewed: v.viewed,
+    comments: v.comments.filter(isComment),
+  }
+}
+
+/** Saves the session's list to the store when it changed since the last save; an empty list drops it. */
+async function persist($: EngineInterface): Promise<void> {
+  if (!sessionId) return
+  const now = await stamp($)
+  if (now === savedStamp) return
+  savedStamp = now
+  const key = `session:${sessionId}`
+  const index = asIndex(await $.store.get(INDEX))
+  const list = await read($, files)
+  if (list.length === 0) {
+    if (index[sessionId]) {
+      await $.store.delete(key)
+      await $.store.set(INDEX, without(index, sessionId))
+    }
+    return
+  }
+
+  const unsaved = await read($, drafts)
+  const notes = await read($, comments)
+  const marks = await read($, viewed)
+  const keep = (paths: ReadonlySet<string>): SavedSession => ({
+    version: 1,
+    savedAt: Date.now(),
+    files: list.filter(f => paths.has(f.path)).map(toSaved),
+    dropped: list.length - paths.size,
+    drafts: Object.fromEntries(Object.entries(unsaved).filter(([p]) => paths.has(p))),
+    nextId: 0,
+    active: '',
+    baseMode: 'session',
+    turnId: '',
+    isSplit: false,
+    ignoreWhitespace: false,
+    viewed: Object.fromEntries(Object.entries(marks).filter(([p]) => paths.has(p))),
+    comments: notes.filter(c => paths.has(c.path)),
+  })
+  // The largest files are left out until the rest fits.
+  const bySize = list
+    .map(f => ({ path: f.path, size: f.base.length + (f.turnBase?.length ?? 0) + (unsaved[f.path]?.length ?? 0) }))
+    .sort((a, b) => a.size - b.size)
+  const paths = new Set(bySize.map(x => x.path))
+  let saved = keep(paths)
+  let text = JSON.stringify(saved)
+  while (text.length > MAX_SAVED && paths.size > 0) {
+    paths.delete(bySize.pop()!.path)
+    saved = keep(paths)
+    text = JSON.stringify(saved)
+  }
+  saved = {
+    ...saved,
+    nextId: await read($, nextId),
+    active: await read($, active),
+    baseMode: await read($, baseMode),
+    turnId: await read($, turnId),
+    isSplit: await read($, isSplit),
+    ignoreWhitespace: await read($, ignoreWhitespace),
+  }
+
+  // The newest other sessions stay while there is room; the rest go.
+  const next: SavedIndex = {}
+  let total = text.length
+  const others = Object.entries(index)
+    .filter(([id]) => id !== sessionId)
+    .sort((a, b) => b[1].savedAt - a[1].savedAt)
+  for (const [id, e] of others) {
+    if (Object.keys(next).length + 1 < MAX_SESSIONS && total + e.size <= MAX_STORE) {
+      next[id] = e
+      total += e.size
+    } else await $.store.delete(`session:${id}`)
+  }
+  await $.store.set(key, saved)
+  await $.store.set(INDEX, { ...next, [sessionId]: { savedAt: saved.savedAt, size: text.length } })
+}
+
+/** Takes back the list this session saved before it was last closed, with each file read again from disk. */
+async function restore($: EngineInterface): Promise<void> {
+  const saved = asSaved(await $.store.get(`session:${sessionId}`))
+  if (!saved || saved.files.length === 0) return
+  if (!cwd) cwd = await $.session.cwd()
+  const list: TrackedFile[] = []
+  for (const s of saved.files) {
+    const text = await readText($, s.path)
+    const draft = saved.drafts[s.path]
+    // Changed back to how it was before Claude while the session was closed: nothing left to show.
+    if (text === s.base && draft === undefined) continue
+    const { diskHash, ...rest } = s
+    list.push({
+      ...rest,
+      turnBase: s.turnBase ?? s.base,
+      disk: text ?? '',
+      rev: 1,
+      conflict: draft !== undefined && text !== undefined && fingerprint(text) !== diskHash,
+      isDeleted: text === undefined,
+      ...((await statOf($, s.path)) ?? { mtimeMs: 0, size: 0 }),
+    })
+  }
+  const paths = new Set(list.map(f => f.path))
+  const kept = <T,>(d: Record<string, T>) => Object.fromEntries(Object.entries(d).filter(([p]) => paths.has(p)))
+  await update($, files, () => list)
+  await update($, drafts, () => kept(saved.drafts))
+  await update($, nextId, n => Math.max(n, saved.nextId, ...list.map(f => f.id + 1)))
+  await update($, active, () => (paths.has(saved.active) ? saved.active : ''))
+  await update($, baseMode, () => saved.baseMode)
+  await update($, turnId, t => t || saved.turnId)
+  await update($, isSplit, () => saved.isSplit)
+  await update($, ignoreWhitespace, () => saved.ignoreWhitespace)
+  await update($, viewed, () => kept(saved.viewed))
+  await update($, comments, () => saved.comments.filter(c => paths.has(c.path)))
+  if (saved.baseMode === 'head') await refreshHeads($)
+  if (saved.dropped > 0) {
+    $.ui.toast(`${fileCount(saved.dropped)} of the last session were too large to keep, and are not listed`)
+  }
+  savedStamp = await stamp($)
 }
 
 async function save($: EngineInterface, path: string, text: string): Promise<void> {
@@ -620,7 +842,16 @@ export const register: Register = on => {
     const isUp = (await $.ui.panes()).some(p => p.id === PANE)
     await update($, isPaneOpen, () => isUp)
     await update($, seen, () => ({}))
+    // A resumed session: its list as it was when it closed. A hot reload keeps the list as it is.
+    sessionId = await $.session.id().catch(() => '')
+    if (sessionId && (await read($, files)).length === 0) await restore($).catch(() => {})
     $.clock.every(POLL_MS, () => void poll($).catch(() => {}))
+
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    await persist($).catch(() => {})
 
     return next(e)
   })
@@ -658,6 +889,14 @@ export const register: Register = on => {
     return ran
   })
 
+  // The wheel over the file list scrolls the list, when it has more files than it shows.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    if (!isOverList || e.origin.kind !== 'person' || !e.pointer || (await read($, files)).length <= ROWS) return next(e)
+    await update($, listScroll, was => ({ seq: (was?.seq ?? 0) + 1, by: e.by }))
+
+    return {}
+  })
+
   // The surface could not draw an editor's rows: draw fewer of them, in a new instance.
   on('ui.fault', async ($, e, next) => {
     const id = /^file-(\d+)/.exec(e.element)?.[1]
@@ -678,6 +917,10 @@ export const register: Register = on => {
   // text, the lines under its cursor and the counters of its actions).
   on('ui.message', async ($, e, next) => {
     if (e.requestId !== PANE) return next(e)
+    if (isHover(e.data)) {
+      isOverList = e.data.isOver
+      return next(e)
+    }
     if (isSelect(e.data)) {
       const path = e.data.select
       await update($, active, () => path)
@@ -784,6 +1027,7 @@ export const register: Register = on => {
     const asked = await read($, commands)
     const budgetOf = await read($, budgets)
     const parts = await read($, windows)
+    const wheel = await read($, listScroll)
     const isDark = await isDarkTheme($)
     const selected = list.find(f => f.path === picked) ?? list[0]
     const dirtyCount = list.filter(f => unsaved[f.path] !== undefined).length
@@ -1304,7 +1548,7 @@ export const register: Register = on => {
           <Client
             key="files"
             module="./files.tsx"
-            props={{ rows, selected: f.path, surface: e.surface, isDark }}
+            props={{ rows, selected: f.path, surface: e.surface, isDark, scroll: wheel }}
             width="100%"
           />
         </Box>

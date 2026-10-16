@@ -93,8 +93,37 @@ export type FileWindow = {
   baseKey: string
 }
 
-/** What the file list posts: the file the person picked. */
-export type FilesPost = { select: string; seq: number }
+/** What the file list posts: the file the person picked, or whether the pointer is over it. */
+export type FilesPost = { select: string; seq: number } | { isOver: boolean }
+
+/** A wheel move over the file list, in files, handed to it once per `seq`. */
+export type ListScroll = { seq: number; by: number }
+
+/** A tracked file as kept in the store: its text on disk is read again on restore, and told by its fingerprint. */
+export type SavedFile = Omit<TrackedFile, 'disk' | 'head' | 'rev' | 'conflict' | 'mtimeMs' | 'size'> & {
+  diskHash: string
+}
+
+/** A session's list as kept in the store (`$.store`, key `session:<id>`), to come back to on resume. */
+export type SavedSession = {
+  version: 1
+  savedAt: number
+  files: SavedFile[]
+  /** How many files were left out, too large for the store. */
+  dropped: number
+  drafts: Drafts
+  nextId: number
+  active: string
+  baseMode: BaseMode
+  turnId: string
+  isSplit: boolean
+  ignoreWhitespace: boolean
+  viewed: Record<string, string>
+  comments: ReviewComment[]
+}
+
+/** The sessions kept in the store, by id: when each was saved and its size in characters. */
+export type SavedIndex = Record<string, { savedAt: number; size: number }>
 
 declare module 'claude-code' {
   interface PluginState {
@@ -122,6 +151,8 @@ declare module 'claude-code' {
       budgets: Record<string, number>
       /** By path: the part of each file too large for its editor that the editor holds. */
       windows: Record<string, FileWindow>
+      /** The wheel's last move over the file list. */
+      listScroll: ListScroll | null
     }
   }
 }

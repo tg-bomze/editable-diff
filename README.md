@@ -35,6 +35,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 
 - Every file Claude changed, sorted by path, with its status (`A` added, `M` modified, `D` deleted), its folder, its `+N −N` counts, a dot for unsaved edits and a ✓ for files marked viewed.
 - Pick a file with a click, or with the arrow keys once the list has the focus.
+- **Ten files at a time.** A longer list scrolls within itself: the wheel over it, the scrollbar at its right edge (drag the thumb, or click above or below it to page), and the arrow keys, which keep the selected file in view.
 - The header counts how many files are viewed: `CHANGED FILES · 1/4 VIEWED`.
 - **Remove from list** forgets one file; the file on disk stays as it is.
 
@@ -81,6 +82,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 - A file changed back to how it was before Claude drops off the list.
 - If a file changes on disk while you have unsaved edits in it, the panel asks whether to **Take the disk version** or **Keep mine**.
 - A file deleted from disk is marked so; Save creates it again.
+- **Survives a restart.** Close Claude Code and resume the session: the list comes back with its unsaved edits, comments and viewed marks, each file read again from disk. A file changed back while the session was closed drops off; one changed under unsaved edits asks which to keep.
 
 ### On the phone
 
@@ -143,7 +145,7 @@ The editor takes the keys once you click in it.
 - Review comments go to Claude as a user message.
 - Every second it checks the tracked files' size and modification time and reads any that changed.
 - Saving writes the file and adds a note to the conversation, so Claude reads the file again before editing it.
-- The list lives for the session.
+- The list is saved to the mod's store every couple of seconds while it changes, under the session's id, and taken back when that session resumes. The store keeps the 20 most recent sessions within 3.5 MB; the oldest go first, and a session's largest files are left out past 1.5 MB.
 - The palette follows the light or dark theme set in Claude Code.
 
 ## What it does on your machine
@@ -152,7 +154,7 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 
 - **Network:** none.
 - **Reads** the files Claude edits or writes, before and after each edit, and checks their size and modification time every second. Around a shell command in a git repository it reads the files git lists as changed (up to 2,000 files of 1 MB each).
-- **Writes** a file only when you press **Save**, **Save all** or Cmd/Ctrl+S, and only a file on the list.
+- **Writes** a file only when you press **Save**, **Save all** or Cmd/Ctrl+S, and only a file on the list. Besides, it writes its own store (below).
 - **Runs** a program only for **Compare with: Git HEAD**, around Claude's shell commands and for **Open in editor**, with fixed arguments and no shell:
   - `git -C <folder> rev-parse` and `git -C <folder> cat-file blob HEAD:./<file>`, which only read: no hook, filter or pager runs;
   - `git -C <folder> status --porcelain -z`, before and after a shell command of Claude's, with optional locks and fsmonitor off. Like any `git status`, it can run the repository's clean filters (Git LFS, say) on files whose timestamps changed;
@@ -160,7 +162,7 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 - **Tells Claude** only what you send: a note that you saved a file, so it reads the file again, and your review comments when you press **Send to Claude** or **Put in prompt**. Quoted lines sit in a code fence their own text cannot close.
 - **Copies** to the clipboard only on Cmd/Ctrl+C or X.
 - **Shows** what text hides: control characters, zero-width spaces and bidirectional overrides ("Trojan Source") draw as `·` or `�`, in the diff and in file names.
-- **Keeps** its list, unsaved edits and comments for the session only.
+- **Keeps** each session's list in the mod's store, a JSON file Claude Code keeps for it in your Claude configuration folder: the paths, each file's text before Claude's edits (and at the start of the last turn, when that differs), your unsaved edits, review comments and viewed marks, and the panel's settings. Not the files' current text: that is read again from disk. The 20 most recent sessions are kept, within 3.5 MB; **Clear these diffs** removes a session's entry.
 
 ## Limitations
 
@@ -169,6 +171,7 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 - A single line too long to hand to the editor (about 90,000 characters) has to be edited elsewhere: **Open in editor**.
 - A surface draws a limited tree, so the editor draws about 100 rows of a diff at a time, fewer for long lines. If a surface still cannot draw them, the editor tries again with half as many.
 - Keys go to the editor only after a click in it, and some hosts keep F7 or Cmd+F for themselves: the buttons do the same.
+- The list comes back only in the session that made it, resumed: `/clear` or a new session starts an empty one. A file whose saved text the store could not take is left out, and the panel says so.
 - A diff past ten million steps of work, rare outside generated files, is drawn as one removed block followed by one added block.
 
 ## Development

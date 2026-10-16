@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, FoundElement } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import type { SavedSession } from '../types'
+import { fingerprint } from '../hooks/diff'
 import { tokenize } from '../hooks/highlight'
 import { shiftWindow, slices, spliceBack, windowFor } from '../hooks/window'
 
@@ -64,6 +66,17 @@ function world(on: On, files: Record<string, string>, { isPlaced = true } = {}) 
   })
 
   return { disk, toasts, copies, touch }
+}
+
+/** The mod's store in memory, as the test can read it. */
+function memoryStore(on: On, entries: Record<string, unknown> = {}) {
+  const store = new Map(Object.entries(entries).map(([k, v]) => [k, JSON.stringify(v)]))
+  on('store.get', ($, e) => ({ value: store.has(e.key) ? JSON.parse(store.get(e.key)!) : undefined }))
+  on('store.set', ($, e) => (store.set(e.key, JSON.stringify(e.value)), { value: undefined }))
+  on('store.delete', ($, e) => (store.delete(e.key), { value: undefined }))
+  on('store.keys', () => ({ value: [...store.keys()] }))
+
+  return { get: (key: string) => (store.has(key) ? JSON.parse(store.get(key)!) : undefined) }
 }
 
 async function claudeEdits($: Engine, old_string: string, new_string: string) {
@@ -763,4 +776,177 @@ test('a part of a file splices back in place, CRLF kept, and the parts cover the
   }
   expect(seen.size).toBe(20000)
   expect(shiftWindow(big, big, part, -1)!.line).toBeLessThan(part.line)
+})
+
+test('the file list shows ten files and scrolls the rest: keys, wheel, scrollbar', async ($, on) => {
+  const paths = Array.from({ length: 15 }, (_, i) => `/proj/src/f${String(i).padStart(2, '0')}.ts`)
+  world(on, Object.fromEntries(paths.map(p => [p, 'x\n'])))
+  let paneScrolls = 0
+  on('ui.scroll', () => {
+    paneScrolls++
+    return {}
+  })
+  for (const p of paths) await $.tool.call({ tool: 'Edit', file_path: p, old_string: 'x', new_string: 'y' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const shown = async () =>
+    (await ui.findAll({ type: 'Box', in: 'files' }))
+      .map(b => b.key ?? '')
+      .filter(k => k.startsWith('f-'))
+      .map(k => k.replace(/^f-\/proj\/src\/|\.ts$/g, ''))
+  const names = (from: number) => paths.slice(from, from + 10).map((_, i) => `f${String(from + i).padStart(2, '0')}`)
+  // The file Claude edited last is selected, and in view.
+  expect(await shown()).toEqual(names(5))
+
+  // Up past the first file shown brings the selected one into view.
+  for (let i = 0; i < 10; i++) await ui.key({ key: 'up', in: 'files' })
+  expect(await shown()).toEqual(names(4))
+  expect(await ui.find({ type: 'Client', key: 'file-5' })).toBeDefined()
+
+  // The wheel over the list scrolls the list, not the pane.
+  await ui.pointer({ type: 'enter', x: 1, y: 1, in: 'files' })
+  const wheel = (by: number) =>
+    $.ui.scroll({
+      component: 'Pane',
+      requestId: 'editable-diff',
+      offset: 0,
+      by,
+      bodyRows: 40,
+      contentRows: 60,
+      origin: { kind: 'person' },
+      pointer: { column: 2, row: 3 },
+    } as never)
+  await wheel(-3)
+  expect(await shown()).toEqual(names(1))
+  await wheel(-3)
+  expect(await shown()).toEqual(names(0))
+  await wheel(9)
+  expect(await shown()).toEqual(names(5))
+
+  // A click picks the file under it, in the scrolled list.
+  await ui.pointer({ type: 'down', x: 2, y: 0, button: 'left', in: 'files' })
+  expect(await ui.find({ type: 'Client', key: 'file-6' })).toBeDefined()
+
+  // Above the thumb, the scrollbar pages up.
+  await ui.resize({ columns: 30, rows: 10, in: 'files' })
+  await ui.pointer({ type: 'down', x: 29, y: 0, button: 'left', in: 'files' })
+  expect((await shown())[0]).toBe('f00')
+
+  // Off the list, the wheel goes to the pane again.
+  await ui.pointer({ type: 'leave', x: 1, y: 1, in: 'files' })
+  expect(paneScrolls).toBe(0)
+  await wheel(3)
+  expect((await shown())[0]).toBe('f00')
+  expect(paneScrolls).toBe(1)
+  await ui.unmount()
+})
+
+test('the list is saved for the session; clearing it drops it from the store', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\n' })
+  const clock = mock.clock(on)
+  const store = memoryStore(on)
+  on('session.id', () => ({ value: 's1' }))
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.key({ key: 'Z', in: 'file-1' })
+  await clock.advance(2000)
+
+  const saved = store.get('session:s1') as SavedSession
+  expect(saved.files.map(f => [f.path, f.base, f.turnBase])).toEqual([[FILE, 'one\ntwo\n', undefined]])
+  expect(saved.drafts[FILE]).toBe('Zone\nTWO\n')
+  expect(Object.keys(store.get('sessions'))).toEqual(['s1'])
+
+  await ui.press({ key: 'clear' })
+  await ui.press({ key: 'clear-yes' })
+  await clock.advance(2000)
+  expect(store.get('session:s1')).toBeUndefined()
+  expect(store.get('sessions')).toEqual({})
+  await ui.unmount()
+})
+
+test('a resumed session finds its list again, each file read afresh from disk', async ($, on) => {
+  const B = '/proj/src/b.ts'
+  const C = '/proj/src/c.ts'
+  const saved: SavedSession = {
+    version: 1,
+    savedAt: 1,
+    files: [
+      {
+        id: 1,
+        path: FILE,
+        display: 'src/a.ts',
+        base: 'one\ntwo\n',
+        isNew: false,
+        isDeleted: false,
+        isExpanded: false,
+        turnId: 't',
+        diskHash: fingerprint('one\nTWO\n'),
+      },
+      {
+        id: 2,
+        path: B,
+        display: 'src/b.ts',
+        base: 'uno\n',
+        isNew: false,
+        isDeleted: false,
+        isExpanded: false,
+        turnId: 't',
+        diskHash: fingerprint('UNO\n'),
+      },
+      {
+        id: 3,
+        path: C,
+        display: 'src/c.ts',
+        base: 'x\n',
+        isNew: false,
+        isDeleted: false,
+        isExpanded: false,
+        turnId: 't',
+        diskHash: fingerprint('y\n'),
+      },
+    ],
+    dropped: 0,
+    drafts: { [B]: 'UNO!\n' },
+    nextId: 4,
+    active: B,
+    baseMode: 'session',
+    turnId: 't',
+    isSplit: false,
+    ignoreWhitespace: false,
+    viewed: {},
+    comments: [],
+  }
+  // While the session was closed: b.ts changed under its draft, c.ts went back to how it was.
+  world(on, { [FILE]: 'one\nTWO\n', [B]: 'UNO?\n', [C]: 'x\n' })
+  mock.clock(on)
+  memoryStore(on, { 'session:s1': saved, sessions: { s1: { savedAt: 1, size: 1 } } })
+  on('session.id', () => ({ value: 's1' }))
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const listed = (await ui.findAll({ type: 'Box', in: 'files' })).map(b => b.key).filter(k => k?.startsWith('f-'))
+  expect(listed).toEqual([`f-${FILE}`, `f-${B}`])
+  expect(await ui.find({ type: 'Text', text: /changed on disk while you had unsaved edits/ })).toBeDefined()
+  expect(await line(ui, /UNO!$/, 'file-2')).toBeDefined()
+  await ui.press({ key: 'take-2' })
+  expect(await line(ui, /UNO\?$/, 'file-2')).toBeDefined()
+  await ui.unmount()
+})
+
+test('a file with a long folder keeps to one row of the list, so a click picks the file under it', async ($, on) => {
+  const LONG = `/private/tmp/${'very-long-folder-name/'.repeat(8)}notes.md`
+  world(on, { [LONG]: 'a\n', [FILE]: 'one\n' })
+  await $.tool.call({ tool: 'Edit', file_path: LONG, old_string: 'a', new_string: 'b' })
+  await claudeEdits($, 'one', 'ONE')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const rows = (await ui.findAll({ type: 'Box', in: 'files' })).filter(b => b.key?.startsWith('f-'))
+  expect(rows.map(r => [r.props.height, r.props.overflow])).toEqual([
+    [1, 'hidden'],
+    [1, 'hidden'],
+  ])
+  // Sorted by path, the long one is first: row 0, under src/a.ts selected as Claude's last edit.
+  expect(await ui.find({ type: 'Client', key: 'file-2' })).toBeDefined()
+  await ui.pointer({ type: 'down', x: 2, y: 0, button: 'left', in: 'files' })
+  expect(await ui.find({ type: 'Client', key: 'file-1' })).toBeDefined()
+  await ui.unmount()
 })

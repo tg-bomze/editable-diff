@@ -1,6 +1,6 @@
 {
   "name": "editable-diff",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A panel with Claude's edits: a GitHub Desktop-style diff you can edit in place and save",
   "author": {
     "name": "Denis Malimonov"

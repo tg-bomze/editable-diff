@@ -1,6 +1,6 @@
 // The changed-files list, as GitHub Desktop's sidebar draws it: one row per
 // file with its status, name, folder and counts; the selected row highlighted.
-// A click or up/down posts the file to select.
+// A file marked as viewed is ticked and dimmed. A click or up/down posts the file to select.
 
 import type { ClientModule } from 'claude-code'
 
@@ -15,6 +15,7 @@ export type FileRow = {
   added: number
   removed: number
   isDirty: boolean
+  isViewed: boolean
 }
 
 export type FilesProps = {
@@ -75,7 +76,10 @@ const Files: ClientModule<FilesProps, State> = (props, surface) => {
           >
             <Text wrap="truncate-end" inverse={isSelected && !isApp}>
               <Text color="suggestion">{isSelected ? '▎' : ' '}</Text>
-              <Text weight={isSelected ? 'semibold' : undefined}>{row.name}</Text>
+              {row.isViewed ? <Text color="success">✓ </Text> : ''}
+              <Text weight={isSelected ? 'semibold' : undefined} dimColor={row.isViewed && !isSelected}>
+                {row.name}
+              </Text>
               {row.dir ? <Text dimColor> {row.dir}</Text> : ''}
             </Text>
             <Text tabular wrap="truncate-start">

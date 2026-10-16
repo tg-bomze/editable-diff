@@ -339,3 +339,201 @@ test('long changed lines: the window stops short of the tree bounds, and Show ne
   expect(after[0]).toBe(`value${Number(/\d+/.exec(last)![0]) + 1} `)
   await ui.unmount()
 })
+
+test('↺ Revert at the end of a change puts its lines back', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.resize({ columns: 60, rows: 40, in: 'file-1' })
+  expect(await ui.find({ type: 'Text', text: /Revert/, in: 'file-1' })).toBeDefined()
+
+  // Row 1 starts the change (-two); its last 10 cells are the label.
+  await ui.pointer({ type: 'down', x: 55, y: 1, button: 'left', in: 'file-1' })
+  expect(await ui.find({ type: 'Text', text: /^\+0 −0$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /unsaved/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('comments on lines go to Claude as one message, with the lines quoted', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  const sent: string[] = []
+  on('prompt.submit', ($, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // On "three", Cmd+Enter opens the comment box for its line.
+  await ui.pointer({ type: 'down', x: 8, y: 3, button: 'left', in: 'file-1' })
+  await ui.pointer({ type: 'up', x: 8, y: 3, button: 'left', in: 'file-1' })
+  await ui.key({ key: 'return', meta: true, in: 'file-1' })
+  expect(await ui.find({ type: 'Text', text: /Comment on line 3/ })).toBeDefined()
+  await ui.input({ key: 'comment-input', text: 'Spell it out' })
+  expect(await ui.find({ type: 'Text', text: /Review comments/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '●', in: 'file-1' })).toBeDefined()
+
+  await ui.press({ key: 'comments-send' })
+  expect(sent.length).toBe(1)
+  expect(sent[0]).toContain('src/a.ts, line 3')
+  expect(sent[0]).toContain('three')
+  expect(sent[0]).toContain('Spell it out')
+  expect(await ui.find({ type: 'Text', text: /Review comments/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Viewed hides the diff until the file changes again', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'viewed-1' })
+  expect(await ui.find({ type: 'Text', text: /Marked as viewed/ })).toBeDefined()
+  expect(await ui.find({ type: 'Client', key: 'file-1' })).toBeUndefined()
+
+  await claudeEdits($, 'three', 'THREE')
+  expect(await ui.find({ type: 'Text', text: /Marked as viewed/ })).toBeUndefined()
+  expect(await line(ui, /THREE/)).toBeDefined()
+  await ui.unmount()
+})
+
+test('F7 goes from change to change, then on to the next file', async ($, on) => {
+  const B = '/proj/src/b.ts'
+  const { toasts } = world(on, { [FILE]: 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n', [B]: 'uno\n' })
+  await claudeEdits($, 'b', 'B')
+  await claudeEdits($, 'l', 'L')
+  await $.tool.call({ tool: 'Edit', file_path: B, old_string: 'uno', new_string: 'UNO' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.pointer({ type: 'down', x: 2, y: 0, button: 'left', in: 'files' })
+
+  await ui.key({ key: 'f7', in: 'file-1' })
+  await ui.key({ key: 'X', in: 'file-1' })
+  expect(await line(ui, /XB$/)).toBeDefined()
+  await ui.key({ key: 'f7', in: 'file-1' })
+  await ui.key({ key: 'Y', in: 'file-1' })
+  expect(await line(ui, /YL$/)).toBeDefined()
+
+  // Past the last change: b.ts, the next file.
+  await ui.key({ key: 'f7', in: 'file-1' })
+  expect(await ui.find({ type: 'Text', text: /^b\.ts$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Client', key: 'file-2' })).toBeDefined()
+  await ui.key({ key: 'f7', in: 'file-2' })
+  await ui.key({ key: 'f7', in: 'file-2' })
+  expect(toasts).toContain('No more changes after this one')
+  await ui.unmount()
+})
+
+test('Cmd+F finds, Tab moves to Replace, Cmd+Enter replaces every match', async ($, on) => {
+  world(on, { [FILE]: 'foo\nbar\nfoo\n' })
+  await claudeEdits($, 'bar', 'BAR')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.key({ key: 'f', meta: true, in: 'file-1' })
+  expect(await ui.find({ type: 'Box', key: 'find', in: 'file-1' })).toBeDefined()
+  for (const key of ['f', 'o', 'o', 'tab', 'q', 'u', 'x']) await ui.key({ key, in: 'file-1' })
+  await ui.key({ key: 'return', meta: true, in: 'file-1' })
+  expect(await ui.find({ type: 'Text', text: /^\+3 −3$/ })).toBeDefined()
+  expect((await lines(ui)).filter(l => /qux$/.test(l.text)).length).toBe(2)
+
+  await ui.key({ key: 'f', meta: true, in: 'file-1' })
+  expect(await ui.find({ type: 'Box', key: 'find', in: 'file-1' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Open in editor runs the first editor found, at the cursor line', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  const runs: string[][] = []
+  on('process.run', ($, e) => {
+    runs.push([...e.argv])
+    const ok = e.argv[0] === 'cursor'
+    return {
+      value: { exitCode: ok ? 0 : 127, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }
+  })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.pointer({ type: 'down', x: 8, y: 3, button: 'left', in: 'file-1' })
+  await ui.pointer({ type: 'up', x: 8, y: 3, button: 'left', in: 'file-1' })
+
+  await ui.press({ key: 'open-1' })
+  expect(runs).toEqual([
+    ['code', '-g', `${FILE}:3`],
+    ['cursor', '-g', `${FILE}:3`],
+  ])
+  await ui.unmount()
+})
+
+test('Last turn compares with the file as the turn found it', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  await $.turn.start({ text: 'first', turnId: 't1' })
+  await claudeEdits($, 'two', 'TWO')
+  await $.turn.start({ text: 'second', turnId: 't2' })
+  await claudeEdits($, 'three', 'THREE')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^\+2 −2$/ })).toBeDefined()
+
+  await ui.press({ key: 'base-turn' })
+  expect(await ui.find({ type: 'Text', text: /^\+1 −1$/ })).toBeDefined()
+  expect((await line(ui, /TWO/))?.bg).toBeUndefined()
+  expect((await line(ui, /THREE/))?.bg).toBe('#2ea04326')
+
+  await ui.press({ key: 'revert-1' })
+  expect(await ui.find({ type: 'Text', text: /^\+0 −0$/ })).toBeDefined()
+  await ui.press({ key: 'base-session' })
+  expect(await ui.find({ type: 'Text', text: /^\+1 −1$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('Git HEAD compares with the committed file, or says the folder is not a repository', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  let isRepo = true
+  on('process.run', ($, e) => {
+    const out = (exitCode: number, stdout = '') => ({
+      value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    })
+    if (!isRepo) return out(128)
+    if (e.argv.includes('rev-parse')) return out(0, 'true\n')
+    if (e.argv.includes('show')) return out(0, 'zero\ntwo\nthree\n')
+    return out(1)
+  })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'base-head' })
+  expect(await ui.find({ type: 'Text', text: /^\+2 −2$/ })).toBeDefined()
+  expect((await line(ui, /zero/))?.bg).toBe('#f8514926')
+
+  isRepo = false
+  await ui.press({ key: 'base-session' })
+  await ui.press({ key: 'base-head' })
+  expect(await ui.find({ type: 'Text', text: /Not in a git repository/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^\+1 −1$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('Split shows the old line beside the new one', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  await claudeEdits($, 'two', 'TWO')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.resize({ columns: 80, rows: 40, in: 'file-1' })
+
+  await ui.press({ key: 'split' })
+  const row = await line(ui, /two.*TWO/)
+  expect(row).toBeDefined()
+  expect(await line(ui, /one.*one/)).toBeDefined()
+  expect((await lines(ui)).length).toBe(4)
+  await ui.unmount()
+})
+
+test('Ignore whitespace hides changes that only re-indent', async ($, on) => {
+  world(on, { [FILE]: 'one\ntwo\nthree\n' })
+  await claudeEdits($, 'two', '    two')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^\+1 −1$/ })).toBeDefined()
+
+  await ui.press({ key: 'whitespace' })
+  expect(await ui.find({ type: 'Text', text: /^\+0 −0$/ })).toBeDefined()
+  expect((await line(ui, /two/))?.bg).toBeUndefined()
+  await ui.unmount()
+})

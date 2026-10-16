@@ -17,12 +17,21 @@ export function splitLines(text: string): string[] {
   return text.split('\n')
 }
 
-export function diffLines(a: readonly string[], b: readonly string[]): Row[] {
+export type DiffOptions = {
+  /** Lines that differ only in whitespace count as unchanged. */
+  ignoreWhitespace?: boolean
+}
+
+const squeeze = (line: string) => line.replace(/\s+/g, ' ').trim()
+
+export function diffLines(a: readonly string[], b: readonly string[], options: DiffOptions = {}): Row[] {
+  const ka = options.ignoreWhitespace ? a.map(squeeze) : a
+  const kb = options.ignoreWhitespace ? b.map(squeeze) : b
   let start = 0
-  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  while (start < a.length && start < b.length && ka[start] === kb[start]) start++
   let endA = a.length
   let endB = b.length
-  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+  while (endA > start && endB > start && ka[endA - 1] === kb[endB - 1]) {
     endA--
     endB--
   }
@@ -39,13 +48,15 @@ export function diffLines(a: readonly string[], b: readonly string[]): Row[] {
     for (let i = n - 1; i >= 0; i--) {
       for (let j = m - 1; j >= 0; j--) {
         t[i * w + j] =
-          a[start + i] === b[start + j] ? t[(i + 1) * w + j + 1]! + 1 : Math.max(t[(i + 1) * w + j]!, t[i * w + j + 1]!)
+          ka[start + i] === kb[start + j]
+            ? t[(i + 1) * w + j + 1]! + 1
+            : Math.max(t[(i + 1) * w + j]!, t[i * w + j + 1]!)
       }
     }
     let i = 0
     let j = 0
     while (i < n || j < m) {
-      if (i < n && j < m && a[start + i] === b[start + j]) {
+      if (i < n && j < m && ka[start + i] === kb[start + j]) {
         rows.push({ kind: 'ctx', text: b[start + j]!, oldNo: start + i + 1, newNo: start + j + 1 })
         i++
         j++
@@ -106,6 +117,19 @@ export function countChanges(rows: readonly Row[]): { added: number; removed: nu
   }
 
   return { added, removed }
+}
+
+/** The changes as [start, end) row ranges: each a run of removed and added rows between unchanged ones. */
+export function changeBlocks(rows: readonly Row[]): [number, number][] {
+  const out: [number, number][] = []
+  for (let k = 0; k < rows.length; k++) {
+    if (rows[k]!.kind === 'ctx') continue
+    const start = k
+    while (k + 1 < rows.length && rows[k + 1]!.kind !== 'ctx') k++
+    out.push([start, k + 1])
+  }
+
+  return out
 }
 
 /** A letter, digit, `_` or `$`: what a word is made of, for change marks and double-click. */

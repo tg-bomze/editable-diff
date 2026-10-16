@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, Register } from 'claude-code'
 
 import type { BaseMode, Counters, EditorCommand, EditorPost, FilesPost, ReviewComment, TrackedFile } from '../types'
-import { countChanges, diffLines, fingerprint, makePatch, splitLines } from './diff'
+import { countChanges, diffLines, fingerprint, makePatch, printable, splitLines } from './diff'
 import type { FileRow } from './files'
 import { languageOf } from './highlight'
 
@@ -152,9 +152,10 @@ async function headOf($: EngineInterface, path: string): Promise<string | null> 
   try {
     const inside = await $.process.run(['git', '-C', dir, 'rev-parse', '--is-inside-work-tree'])
     if (inside.exitCode !== 0 || inside.stdout.trim() !== 'true') return null
-    const shown = await $.process.run(['git', '-C', dir, 'show', `HEAD:./${path.slice(at + 1)}`])
+    // cat-file prints the blob as stored: no textconv or other filter the repository's config could name runs.
+    const shown = await $.process.run(['git', '-C', dir, 'cat-file', 'blob', `HEAD:./${path.slice(at + 1)}`])
 
-    return shown.exitCode === 0 ? shown.stdout : ''
+    return shown.exitCode === 0 && !shown.isStdoutTruncated ? shown.stdout : ''
   } catch {
     return null
   }
@@ -226,7 +227,7 @@ async function track(
       : {
           id,
           path,
-          display: relative(path, cwd),
+          display: printable(relative(path, cwd)),
           base: before ?? '',
           disk: after,
           rev: 1,
@@ -385,8 +386,10 @@ function reviewText(list: readonly ReviewComment[]): string {
   const parts = list.map((c, n) => {
     const lines = c.quote.split('\n')
     const quote = lines.slice(0, QUOTE_LINES).join('\n') + (lines.length > QUOTE_LINES ? '\n…' : '')
+    // A fence longer than any run of backticks in the quote: the file's text cannot close it.
+    const fence = '`'.repeat(Math.max(3, ...(quote.match(/`+/g) ?? []).map(run => run.length + 1)))
 
-    return `${n + 1}. ${c.display}, ${lineRange(c.from, c.to)}:\n\`\`\`${languageOf(c.path) ?? ''}\n${quote}\n\`\`\`\n${c.text.trim()}`
+    return `${n + 1}. ${c.display}, ${lineRange(c.from, c.to)}:\n${fence}${languageOf(c.path) ?? ''}\n${quote}\n${fence}\n${c.text.trim()}`
   })
 
   return `Please address my review comments on your changes:\n\n${parts.join('\n\n')}`
@@ -411,7 +414,11 @@ async function sendComments($: EngineInterface, how: 'submit' | 'fill'): Promise
   await update($, comments, () => [])
 }
 
-/** Opens the file at the line in the first editor found: VS Code, Cursor, Zed, Sublime, then the system's. */
+/**
+ * Opens the file at the line in the first editor found: VS Code, Cursor, Zed,
+ * Sublime, then macOS's text editor. Never the file's default app: for a script
+ * or an app bundle that would run it.
+ */
 async function openInEditor($: EngineInterface, path: string, line: number): Promise<void> {
   const at = `${path}:${line}`
   const tries = [
@@ -421,8 +428,7 @@ async function openInEditor($: EngineInterface, path: string, line: number): Pro
     ['subl', at],
     ['/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code', '-g', at],
     ['/Applications/Cursor.app/Contents/Resources/app/bin/cursor', '-g', at],
-    ['open', path],
-    ['xdg-open', path],
+    ['open', '-t', path],
   ]
   for (const argv of tries) {
     try {

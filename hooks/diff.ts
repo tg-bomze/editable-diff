@@ -132,6 +132,32 @@ export function changeBlocks(rows: readonly Row[]): [number, number][] {
   return out
 }
 
+/**
+ * A character that draws as nothing or hides what the text around it says:
+ * C1 controls, zero-width spaces, line separators, bidirectional overrides
+ * and isolates ("Trojan Source"), a byte order mark past the start.
+ */
+export const isHiddenChar = (code: number) =>
+  (code >= 0x80 && code <= 0x9f) ||
+  code === 0x200b ||
+  code === 0x200e ||
+  code === 0x200f ||
+  (code >= 0x2028 && code <= 0x202e) ||
+  (code >= 0x2060 && code <= 0x2064) ||
+  (code >= 0x2066 && code <= 0x2069) ||
+  code === 0xfeff
+
+/** `text` safe to draw on one line: control and hidden characters, and unpaired surrogates, become `�`. */
+export function printable(text: string): string {
+  let out = ''
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!
+    out += code < 32 || code === 127 || isHiddenChar(code) || (code >= 0xd800 && code <= 0xdfff) ? '\ufffd' : ch
+  }
+
+  return out
+}
+
 /** A letter, digit, `_` or `$`: what a word is made of, for change marks and double-click. */
 export const isWordChar = (c: string | undefined) => c !== undefined && /[\p{L}\p{N}_$]/u.test(c)
 

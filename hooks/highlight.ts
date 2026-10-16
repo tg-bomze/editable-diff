@@ -269,7 +269,8 @@ export function tokenize(
   }
 
   if (lang.keys === 'yaml') {
-    const key = /^(\s*-?\s*)([\w.\-"' ]+?)(\s*[:=])(\s|$)/.exec(line.slice(i))
+    // Words of the key one space apart: no two parts can take the same spaces, so a long line costs one pass.
+    const key = /^(\s*(?:-\s*)?)([\w.\-"']+(?: [\w.\-"']+)*)(\s*[:=])(\s|$)/.exec(line.slice(i))
     if (key && i === 0) tokens.push({ from: key[1]!.length, to: key[1]!.length + key[2]!.length, kind: 'key' })
   }
 

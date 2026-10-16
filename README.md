@@ -71,7 +71,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 - **Viewed.** Mark a file as reviewed: its diff folds away, the list ticks it, and the panel moves on to the next file left to review. The mark comes off by itself when the file changes again.
 - **Next and previous change.** F7 / Shift+F7, or **↓ Next** / **↑ Prev**, move the cursor from change to change. Past the last change of a file they move on to the next file not yet viewed.
 - **Find and replace.** Cmd/Ctrl+F opens a find bar over the diff with the matches marked and a count of them. A capital letter in the query makes it match case. Replace one match or all of them.
-- **Open in editor** opens the file at the cursor line in VS Code, Cursor, Zed or Sublime Text, whichever is found first, else in the system's default app for it.
+- **Open in editor** opens the file at the cursor line in VS Code, Cursor, Zed or Sublime Text, whichever is found first, else on macOS in the default text editor.
 
 ### In sync with the disk
 
@@ -130,12 +130,27 @@ The editor takes the keys once you click in it.
 ## How it works
 
 - The mod wraps Claude's Edit and Write tool calls. Before the first edit of a file it keeps the file's text: the session-start base, until the list is cleared. Before the first edit of a file in each turn it keeps the text again: the last-turn base.
-- **Git HEAD** reads the committed file with `git show HEAD:<file>`, again every few seconds so a commit shows up. A file not yet committed compares with an empty one.
+- **Git HEAD** reads the committed file with `git cat-file blob HEAD:<file>`, again every few seconds so a commit shows up. A file not yet committed compares with an empty one.
 - Review comments go to Claude as a user message.
 - Every second it checks the tracked files' size and modification time and reads any that changed.
 - Saving writes the file and adds a note to the conversation, so Claude reads the file again before editing it.
 - The list lives for the session.
 - The palette follows the light or dark theme set in Claude Code.
+
+## What it does on your machine
+
+The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built or downloaded.
+
+- **Network:** none.
+- **Reads** the files Claude edits or writes, before and after each edit, and checks their size and modification time every second.
+- **Writes** a file only when you press **Save**, **Save all** or Cmd/Ctrl+S, and only a file on the list.
+- **Runs** a program only for **Compare with: Git HEAD** and **Open in editor**, with fixed arguments and no shell:
+  - `git -C <folder> rev-parse --is-inside-work-tree` and `git -C <folder> cat-file blob HEAD:./<file>`, which only read: no hook, filter or pager runs;
+  - `code -g`, `cursor -g`, `zed` or `subl` with `<file>:<line>`, or on macOS `open -t <file>`. Never the file's default app, which for a script or an app bundle would run it.
+- **Tells Claude** only what you send: a note that you saved a file, so it reads the file again, and your review comments when you press **Send to Claude** or **Put in prompt**. Quoted lines sit in a code fence their own text cannot close.
+- **Copies** to the clipboard only on Cmd/Ctrl+C or X.
+- **Shows** what text hides: control characters, zero-width spaces and bidirectional overrides ("Trojan Source") draw as `·` or `�`, in the diff and in file names.
+- **Keeps** its list, unsaved edits and comments for the session only.
 
 ## Limitations
 

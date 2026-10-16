@@ -17,6 +17,7 @@ import {
   countChanges,
   diffLines,
   fingerprint,
+  isHiddenChar,
   isWordChar,
   splitLines,
   visibleRows,
@@ -265,7 +266,8 @@ function measure(line: string): { glyph: string[]; x: number[] } {
   for (let i = 0; i < line.length; i++) {
     const c = line.charCodeAt(i)
     x.push(at)
-    if (c >= 0xd800 && c <= 0xdbff && i + 1 < line.length) {
+    const next = i + 1 < line.length ? line.charCodeAt(i + 1) : 0
+    if (c >= 0xd800 && c <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
       const code = line.codePointAt(i)!
       glyph.push(String.fromCodePoint(code))
       x.push(at)
@@ -278,6 +280,10 @@ function measure(line: string): { glyph: string[]; x: number[] } {
       at += n
     } else if (c < 32 || c === 127) {
       glyph.push('·')
+      at += 1
+    } else if (isHiddenChar(c) || (c >= 0xd800 && c <= 0xdfff)) {
+      // Shown, not hidden: a review must see what the text really holds.
+      glyph.push('\ufffd')
       at += 1
     } else {
       glyph.push(line[i]!)

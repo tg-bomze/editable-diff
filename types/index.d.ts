@@ -63,18 +63,12 @@ export type Counters = {
 export type Drafts = Record<string, string>
 
 /** What the editor posts to the hooks module: a full snapshot, counters cumulative. */
-export type EditorPost = {
+export type EditorPost = Counters & {
   path: string
   /** Which editor instance posted: its counters start at 0. */
   instance: string
   text: string
   isDirty: boolean
-  saveSeq: number
-  copySeq: number
-  focusSeq: number
-  commentSeq: number
-  edgeSeq: number
-  revealSeq: number
   /** What the last copy or cut took. */
   clip: string
   /** The lines the cursor or selection is on, 1-based, inclusive. */

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, Register } from 'claude-code'
 
-import type { BaseMode, EditorCommand, EditorPost, FilesPost, ReviewComment, TrackedFile } from '../types'
+import type { BaseMode, Counters, EditorCommand, EditorPost, FilesPost, ReviewComment, TrackedFile } from '../types'
 import { countChanges, diffLines, fingerprint, makePatch, splitLines } from './diff'
 import type { FileRow } from './files'
 import { languageOf } from './highlight'
@@ -44,6 +44,19 @@ const MODES: { mode: BaseMode; label: string; revert: string }[] = [
   { mode: 'head', label: 'Git HEAD', revert: 'Revert to HEAD' },
 ]
 
+/** The editor's action counters: each one that moved since the last post asks for its action once. */
+const COUNTERS = [
+  'saveSeq',
+  'copySeq',
+  'focusSeq',
+  'commentSeq',
+  'edgeSeq',
+  'revealSeq',
+] as const satisfies readonly (keyof Counters)[]
+
+const countersOf = (from: Partial<Counters>): Counters =>
+  Object.fromEntries(COUNTERS.map(k => [k, from[k] ?? 0])) as Counters
+
 function isPost(data: unknown): data is EditorPost {
   if (typeof data !== 'object' || data === null) return false
   const d = data as Record<string, unknown>
@@ -53,15 +66,13 @@ function isPost(data: unknown): data is EditorPost {
     typeof d.instance === 'string' &&
     typeof d.text === 'string' &&
     typeof d.isDirty === 'boolean' &&
-    typeof d.saveSeq === 'number' &&
-    typeof d.copySeq === 'number' &&
-    typeof d.focusSeq === 'number' &&
-    typeof d.commentSeq === 'number' &&
-    typeof d.edgeSeq === 'number' &&
-    typeof d.revealSeq === 'number' &&
+    COUNTERS.every(k => typeof d[k] === 'number') &&
     typeof d.cmdSeq === 'number' &&
     typeof d.clip === 'string' &&
-    Array.isArray(d.sel)
+    (d.edge === 1 || d.edge === -1) &&
+    Array.isArray(d.sel) &&
+    d.sel.length === 2 &&
+    d.sel.every(n => typeof n === 'number')
   )
 }
 
@@ -501,17 +512,9 @@ export const register: Register = on => {
     const file = (await read($, files)).find(f => f.path === post.path)
     if (!file) return next(e)
     selOf.set(post.path, post.sel)
-    const zero = { saveSeq: 0, copySeq: 0, focusSeq: 0, commentSeq: 0, edgeSeq: 0, revealSeq: 0 }
-    const last = { ...zero, ...(await read($, seen))[post.instance] }
-    const counters = {
-      saveSeq: post.saveSeq,
-      copySeq: post.copySeq,
-      focusSeq: post.focusSeq,
-      commentSeq: post.commentSeq,
-      edgeSeq: post.edgeSeq,
-      revealSeq: post.revealSeq,
-    }
-    if ((Object.keys(counters) as (keyof typeof counters)[]).some(k => counters[k] !== last[k])) {
+    const last = countersOf((await read($, seen))[post.instance] ?? {})
+    const counters = countersOf(post)
+    if (COUNTERS.some(k => counters[k] !== last[k])) {
       await update($, seen, s => ({ ...s, [post.instance]: counters }))
     }
 

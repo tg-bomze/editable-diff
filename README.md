@@ -6,6 +6,22 @@ Review what Claude did, fix a line or two right in the diff, press Save, and Cla
 
 ![The Claude's edits panel: the changed files list on the left, an editable diff of hooks/diff.ts on the right](assets/interface.png)
 
+## Install
+
+In Claude Code:
+
+```
+/plugin install editable-diff --marketplace tg-bomze/editable-diff
+```
+
+From a shell:
+
+```bash
+claude plugin install editable-diff --marketplace tg-bomze/editable-diff
+```
+
+In the desktop app: **+** next to the prompt → **Plugins** → **Add marketplace** `tg-bomze/editable-diff` → **Add plugin**.
+
 ## Features
 
 ### The panel
@@ -65,22 +81,6 @@ Review what Claude did, fix a line or two right in the diff, press Save, and Cla
 - A file deleted from disk is marked so; Save creates it again.
 
 Syntax colours cover JavaScript/TypeScript, Python, Go, Rust, C/C++/Java/C#/Swift/Kotlin, shell, Ruby, YAML, TOML, JSON, CSS, SQL, HTML/XML and Markdown.
-
-## Install
-
-In Claude Code:
-
-```
-/plugin install editable-diff --marketplace tg-bomze/editable-diff
-```
-
-From a shell:
-
-```bash
-claude plugin install editable-diff --marketplace tg-bomze/editable-diff
-```
-
-In the desktop app: **+** next to the prompt → **Plugins** → **Add marketplace** `tg-bomze/editable-diff` → **Add plugin**.
 
 ## Usage
 

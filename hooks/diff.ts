@@ -10,8 +10,33 @@ export type Patch = [at: number, del: number, ins: string[]][]
 
 export const CONTEXT = 5
 
-/** Past this many cells the middle is shown as all removed then all added. */
-const MAX_CELLS = 2_000_000
+/** Regions past this many line pairs split at their unique lines before Myers runs. */
+const PATIENCE_CELLS = 1_000_000
+
+/** The longest run of `pairs` (sorted by their first) whose seconds increase too: patience sorting. */
+function increasing(pairs: readonly [number, number][]): [number, number][] {
+  const tops: number[] = []
+  const back = new Int32Array(pairs.length)
+  for (let p = 0; p < pairs.length; p++) {
+    const j = pairs[p]![1]
+    let lo = 0
+    let hi = tops.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (pairs[tops[mid]!]![1] < j) lo = mid + 1
+      else hi = mid
+    }
+    back[p] = lo > 0 ? tops[lo - 1]! : -1
+    tops[lo] = p
+  }
+  const out: [number, number][] = []
+  for (let p = tops.length ? tops[tops.length - 1]! : -1; p >= 0; p = back[p]!) out.push(pairs[p]!)
+
+  return out.reverse()
+}
+
+/** Past this much work (snake steps) a diff gives up and shows the middle as all removed then all added. */
+const MAX_WORK = 10_000_000
 
 export function splitLines(text: string): string[] {
   return text.split('\n')
@@ -39,32 +64,20 @@ export function diffLines(a: readonly string[], b: readonly string[], options: D
   const rows: Row[] = []
   for (let i = 0; i < start; i++) rows.push({ kind: 'ctx', text: b[i]!, oldNo: i + 1, newNo: i + 1 })
 
-  const n = endA - start
-  const m = endB - start
-  if (n > 0 && m > 0 && (n + 1) * (m + 1) <= MAX_CELLS) {
-    // LCS lengths of the suffixes, row-major over (n + 1) x (m + 1).
-    const w = m + 1
-    const t = new Uint32Array((n + 1) * w)
-    for (let i = n - 1; i >= 0; i--) {
-      for (let j = m - 1; j >= 0; j--) {
-        t[i * w + j] =
-          ka[start + i] === kb[start + j]
-            ? t[(i + 1) * w + j + 1]! + 1
-            : Math.max(t[(i + 1) * w + j]!, t[i * w + j + 1]!)
-      }
-    }
-    let i = 0
-    let j = 0
-    while (i < n || j < m) {
-      if (i < n && j < m && ka[start + i] === kb[start + j]) {
-        rows.push({ kind: 'ctx', text: b[start + j]!, oldNo: start + i + 1, newNo: start + j + 1 })
+  const ops = middleOps(ka, kb, start, endA, endB)
+  if (ops) {
+    let i = start
+    let j = start
+    for (const op of ops) {
+      if (op === 0) {
+        rows.push({ kind: 'ctx', text: b[j]!, oldNo: i + 1, newNo: j + 1 })
         i++
         j++
-      } else if (j < m && (i === n || t[i * w + j + 1]! >= t[(i + 1) * w + j]!)) {
-        rows.push({ kind: 'add', text: b[start + j]!, oldNo: 0, newNo: start + j + 1 })
+      } else if (op === 1) {
+        rows.push({ kind: 'add', text: b[j]!, oldNo: 0, newNo: j + 1 })
         j++
       } else {
-        rows.push({ kind: 'del', text: a[start + i]!, oldNo: start + i + 1, newNo: 0 })
+        rows.push({ kind: 'del', text: a[i]!, oldNo: i + 1, newNo: 0 })
         i++
       }
     }
@@ -76,6 +89,166 @@ export function diffLines(a: readonly string[], b: readonly string[], options: D
   for (let j = start; j < endB; j++) rows.push({ kind: 'add', text: b[j]!, oldNo: 0, newNo: j + 1 })
 
   return [...rows, ...suffix(b, endA, endB)]
+}
+
+/**
+ * The edit script for a[start, endA) against b[start, endB): 0 keep, 1 add, 2
+ * remove, in order. Myers' O(ND) diff in linear space, as git's: its cost
+ * grows with how much differs, not with the size of the file. Undefined past
+ * MAX_WORK.
+ */
+function middleOps(
+  a: readonly string[],
+  b: readonly string[],
+  start: number,
+  endA: number,
+  endB: number,
+): Uint8Array | undefined {
+  // Lines as numbers, so comparing two is one step.
+  const ids = new Map<string, number>()
+  const idOf = (line: string) => {
+    let id = ids.get(line)
+    if (id === undefined) ids.set(line, (id = ids.size))
+    return id
+  }
+  const x = Int32Array.from(a.slice(start, endA), idOf)
+  const shared = ids.size
+  const y = Int32Array.from(b.slice(start, endB), idOf)
+  const ops = new Uint8Array(x.length + y.length)
+  // No line in common: all of one removed, all of the other added, with no search.
+  if (y.every(id => id >= shared)) return ops.fill(2, 0, x.length).fill(1, x.length)
+  let at = 0
+  let work = 0
+  const emit = (op: number, count: number) => {
+    ops.fill(op, at, at + count)
+    at += count
+  }
+
+  // Where a shortest edit path of x[lo1, hi1) against y[lo2, hi2) crosses its middle diagonal band.
+  const bisect = (lo1: number, hi1: number, lo2: number, hi2: number): [number, number] | undefined => {
+    const n = hi1 - lo1
+    const m = hi2 - lo2
+    const max = Math.ceil((n + m) / 2)
+    const offset = max + 1
+    const size = 2 * max + 3
+    const v1 = new Int32Array(size).fill(-1)
+    const v2 = new Int32Array(size).fill(-1)
+    v1[offset + 1] = 0
+    v2[offset + 1] = 0
+    const delta = n - m
+    const isFront = delta % 2 !== 0
+    let k1start = 0
+    let k1end = 0
+    let k2start = 0
+    let k2end = 0
+    for (let d = 0; d < max; d++) {
+      for (let k1 = -d + k1start; k1 <= d - k1end; k1 += 2) {
+        const i1 = offset + k1
+        let x1 = k1 === -d || (k1 !== d && v1[i1 - 1]! < v1[i1 + 1]!) ? v1[i1 + 1]! : v1[i1 - 1]! + 1
+        let y1 = x1 - k1
+        const from1 = x1
+        while (x1 < n && y1 < m && x[lo1 + x1] === y[lo2 + y1]) {
+          x1++
+          y1++
+        }
+        work += 1 + x1 - from1
+        v1[i1] = x1
+        if (x1 > n) k1end += 2
+        else if (y1 > m) k1start += 2
+        else if (isFront) {
+          const i2 = offset + delta - k1
+          if (i2 >= 0 && i2 < size && v2[i2] !== -1 && x1 >= n - v2[i2]!) return [x1, y1]
+        }
+      }
+      for (let k2 = -d + k2start; k2 <= d - k2end; k2 += 2) {
+        const i2 = offset + k2
+        let x2 = k2 === -d || (k2 !== d && v2[i2 - 1]! < v2[i2 + 1]!) ? v2[i2 + 1]! : v2[i2 - 1]! + 1
+        let y2 = x2 - k2
+        const from2 = x2
+        while (x2 < n && y2 < m && x[hi1 - x2 - 1] === y[hi2 - y2 - 1]) {
+          x2++
+          y2++
+        }
+        work += 1 + x2 - from2
+        v2[i2] = x2
+        if (x2 > n) k2end += 2
+        else if (y2 > m) k2start += 2
+        else if (!isFront) {
+          const i1 = offset + delta - k2
+          if (i1 >= 0 && i1 < size && v1[i1] !== -1) {
+            const x1 = v1[i1]!
+            if (x1 >= n - x2) return [x1, offset + x1 - i1]
+          }
+        }
+      }
+      if (work > MAX_WORK) throw RangeError('diff too large')
+    }
+
+    return undefined
+  }
+
+  const walk = (lo1: number, hi1: number, lo2: number, hi2: number): void => {
+    let pre = 0
+    while (lo1 + pre < hi1 && lo2 + pre < hi2 && x[lo1 + pre] === y[lo2 + pre]) pre++
+    let post = 0
+    while (hi1 - post > lo1 + pre && hi2 - post > lo2 + pre && x[hi1 - post - 1] === y[hi2 - post - 1]) post++
+    emit(0, pre)
+    lo1 += pre
+    lo2 += pre
+    hi1 -= post
+    hi2 -= post
+    if (lo1 === hi1) emit(1, hi2 - lo2)
+    else if (lo2 === hi2) emit(2, hi1 - lo1)
+    else {
+      const mid = bisect(lo1, hi1, lo2, hi2)
+      if (mid) {
+        walk(lo1, lo1 + mid[0], lo2, lo2 + mid[1])
+        walk(lo1 + mid[0], hi1, lo2 + mid[1], hi2)
+      } else {
+        emit(2, hi1 - lo1)
+        emit(1, hi2 - lo2)
+      }
+    }
+    emit(0, post)
+  }
+
+  // A large region first splits at the lines found once on each side, in order (patience diff), as git
+  // --patience does: Myers then runs between them, on pieces small enough to stay fast.
+  const split = (lo1: number, hi1: number, lo2: number, hi2: number): void => {
+    if ((hi1 - lo1) * (hi2 - lo2) <= PATIENCE_CELLS) return walk(lo1, hi1, lo2, hi2)
+    const once = (ids: Int32Array, lo: number, hi: number) => {
+      const at = new Map<number, number>()
+      for (let i = lo; i < hi; i++) at.set(ids[i]!, at.has(ids[i]!) ? -1 : i)
+      return at
+    }
+    const inX = once(x, lo1, hi1)
+    const inY = once(y, lo2, hi2)
+    const pairs: [number, number][] = []
+    for (let i = lo1; i < hi1; i++) {
+      const j = inY.get(x[i]!)
+      if (inX.get(x[i]!) === i && j !== undefined && j >= 0) pairs.push([i, j])
+    }
+    const anchors = increasing(pairs)
+    if (!anchors.length) return walk(lo1, hi1, lo2, hi2)
+    let i = lo1
+    let j = lo2
+    for (const [ai, aj] of anchors) {
+      split(i, ai, j, aj)
+      emit(0, 1)
+      i = ai + 1
+      j = aj + 1
+    }
+    split(i, hi1, j, hi2)
+  }
+
+  try {
+    split(0, x.length, 0, y.length)
+  } catch (error) {
+    if (error instanceof RangeError) return undefined
+    throw error
+  }
+
+  return ops.subarray(0, at)
 }
 
 function suffix(b: readonly string[], endA: number, endB: number): Row[] {
@@ -228,6 +401,48 @@ export function visibleRows(rows: readonly Row[], pinned: ReadonlySet<number> = 
   })
 
   return out
+}
+
+/** A line safe for a surface's own code element: tab its only control character. */
+const codeLine = (line: string) => line.replace(/\r$/, '').split('\t').map(printable).join('\t')
+
+/**
+ * The rows as unified-diff hunks (`@@ -a,b +c,d @@`) with CONTEXT lines
+ * around each change, as many whole hunks as fit in `max` characters.
+ */
+export function unifiedDiff(rows: readonly Row[], max: number): { text: string; hunks: number; shown: number } {
+  const visible = visibleRows(rows)
+  const runs: number[][] = []
+  for (const k of visible) {
+    const run = runs[runs.length - 1]
+    if (run && run[run.length - 1] === k - 1) run.push(k)
+    else runs.push([k])
+  }
+  let text = ''
+  let shown = 0
+  for (const run of runs) {
+    let oldBefore = 0
+    let newBefore = 0
+    for (let k = run[0]! - 1; k >= 0 && (!oldBefore || !newBefore); k--) {
+      if (!oldBefore && rows[k]!.oldNo) oldBefore = rows[k]!.oldNo
+      if (!newBefore && rows[k]!.newNo) newBefore = rows[k]!.newNo
+    }
+    const part = run.map(k => rows[k]!)
+    const oldCount = part.filter(r => r.kind !== 'add').length
+    const newCount = part.filter(r => r.kind !== 'del').length
+    const oldStart = part.find(r => r.oldNo)?.oldNo ?? oldBefore
+    const newStart = part.find(r => r.newNo)?.newNo ?? newBefore
+    const sign = { ctx: ' ', add: '+', del: '-' } as const
+    const hunk =
+      `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@\n` +
+      part.map(r => sign[r.kind] + codeLine(r.text)).join('\n') +
+      '\n'
+    if (text.length + hunk.length > max) break
+    text += hunk
+    shown++
+  }
+
+  return { text: text.replace(/\n$/, ''), hunks: runs.length, shown }
 }
 
 /** What turns `text` back into `base`: the hunks of base lines standing for text lines. */

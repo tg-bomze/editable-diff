@@ -79,6 +79,20 @@ export type EditorPost = Counters & {
   cmdSeq: number
 }
 
+/**
+ * The part of a file too large to hand over whole that its editor holds: text
+ * lines [line, line + lines), base lines [baseLine, baseLine + baseLines).
+ */
+export type FileWindow = {
+  line: number
+  lines: number
+  baseLine: number
+  baseLines: number
+  /** The file's `rev` and the base it was cut for: either changing cuts it afresh. */
+  rev: number
+  baseKey: string
+}
+
 /** What the file list posts: the file the person picked. */
 export type FilesPost = { select: string; seq: number }
 
@@ -106,6 +120,8 @@ declare module 'claude-code' {
       commands: Record<string, EditorCommand>
       /** Per editor key: what its rows may serialize to, halved each time the surface refused a drawing. */
       budgets: Record<string, number>
+      /** By path: the part of each file too large for its editor that the editor holds. */
+      windows: Record<string, FileWindow>
     }
   }
 }

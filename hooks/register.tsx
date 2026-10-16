@@ -1,15 +1,27 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, Register } from 'claude-code'
 
-import type { BaseMode, Counters, EditorCommand, EditorPost, FilesPost, ReviewComment, TrackedFile } from '../types'
-import { countChanges, diffLines, fingerprint, makePatch, printable, splitLines } from './diff'
+import type {
+  BaseMode,
+  Counters,
+  EditorCommand,
+  EditorPost,
+  FileWindow,
+  FilesPost,
+  ReviewComment,
+  TrackedFile,
+} from '../types'
+import { countChanges, diffLines, fingerprint, makePatch, printable, splitLines, unifiedDiff } from './diff'
 import type { FileRow } from './files'
 import { languageOf } from './highlight'
+import { isTooLarge, shiftWindow, slices, spliceBack, windowAtChange, windowFor, windowKey } from './window'
 
 const PANE = 'editable-diff'
 const TITLE = "Claude's edits"
 /** A Client's props go whole or not at all; past this the file is shown, not edited. */
 const MAX_PROPS = 95_000
+/** Past this a file's text and patch go to the editor a part at a time. */
+const WINDOW_AT = MAX_PROPS - 5_000
 /** How often files are checked for changes made outside the pane. */
 const POLL_MS = 1000
 /** How many polls between reads of git HEAD, while the diff is drawn against it. */
@@ -17,6 +29,13 @@ const HEAD_POLLS = 5
 /** What an editor's rows may serialize to at first, and at least after the surface refused its drawings. */
 const BUDGET = 50_000
 const MIN_BUDGET = 5_000
+/** Past this many changed files, or this size of one, a shell command's changes are not taken in. */
+const MAX_SHELL_FILES = 2000
+const MAX_SHELL_BYTES = 1_000_000
+/** How much text of files changed already is kept before a shell command. */
+const MAX_SHELL_TOTAL = 20_000_000
+/** What a read-only diff may take of a drawing, on a surface without an editor. */
+const MAX_PLAIN_DIFF = 60_000
 /** How many lines of code a review comment quotes to Claude. */
 const QUOTE_LINES = 40
 
@@ -37,6 +56,7 @@ const comments = atom({ plugin: 'editable-diff', key: 'comments' } as const, [])
 const composing = atom({ plugin: 'editable-diff', key: 'composing' } as const, null)
 const commands = atom({ plugin: 'editable-diff', key: 'commands' } as const, {})
 const budgets = atom({ plugin: 'editable-diff', key: 'budgets' } as const, {})
+const windows = atom({ plugin: 'editable-diff', key: 'windows' } as const, {})
 
 const MODES: { mode: BaseMode; label: string; revert: string }[] = [
   { mode: 'session', label: 'Session start', revert: 'Revert to original' },
@@ -114,6 +134,23 @@ function baseOf(f: TrackedFile, mode: BaseMode, turn: string): string {
   return f.base
 }
 
+/**
+ * The part of `f` its editor holds when the whole file is too large to hand
+ * over, undefined when it is not. Once a file goes by parts it stays so, to
+ * keep its editor.
+ */
+function windowOf(
+  f: TrackedFile,
+  text: string,
+  base: string,
+  mode: BaseMode,
+  kept?: FileWindow,
+): FileWindow | undefined {
+  if (!kept && !isTooLarge(base, text, WINDOW_AT)) return undefined
+
+  return windowFor(base, text, f.rev, `${mode}:${fingerprint(base)}`, kept)
+}
+
 /** The session's folder, read at session start: paths under it are shown relative. */
 let cwd = ''
 /** Paths being written by a save right now: the poll leaves them alone. */
@@ -145,19 +182,105 @@ async function statOf($: EngineInterface, path: string): Promise<{ mtimeMs: numb
   }
 }
 
+/** git, kept from what a status would otherwise run or write: no fsmonitor, no index rewrite. */
+const git = (dir: string, ...args: string[]) => [
+  'git',
+  '--no-optional-locks',
+  '-c',
+  'core.fsmonitor=false',
+  '-C',
+  dir,
+  ...args,
+]
+
 /** The file's text at git HEAD: '' when git does not track it, null outside a repository. */
 async function headOf($: EngineInterface, path: string): Promise<string | null> {
   const at = path.lastIndexOf('/')
   const dir = at > 0 ? path.slice(0, at) : '/'
   try {
-    const inside = await $.process.run(['git', '-C', dir, 'rev-parse', '--is-inside-work-tree'])
+    const inside = await $.process.run(git(dir, 'rev-parse', '--is-inside-work-tree'))
     if (inside.exitCode !== 0 || inside.stdout.trim() !== 'true') return null
     // cat-file prints the blob as stored: no textconv or other filter the repository's config could name runs.
-    const shown = await $.process.run(['git', '-C', dir, 'cat-file', 'blob', `HEAD:./${path.slice(at + 1)}`])
+    const shown = await $.process.run(git(dir, 'cat-file', 'blob', `HEAD:./${path.slice(at + 1)}`))
 
     return shown.exitCode === 0 && !shown.isStdoutTruncated ? shown.stdout : ''
   } catch {
     return null
+  }
+}
+
+/** Each changed or untracked file of the repository `dir` is in, by absolute path, with its two status letters. */
+async function gitChanges($: EngineInterface, dir: string): Promise<Map<string, string> | undefined> {
+  try {
+    const top = await $.process.run(git(dir, 'rev-parse', '--show-toplevel'), { timeoutMs: 5000 })
+    if (top.exitCode !== 0) return undefined
+    const root = top.stdout.trim()
+    const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames', '--ignore-submodules']
+    const status = await $.process.run(git(dir, ...args), { timeoutMs: 10_000 })
+    if (status.exitCode !== 0 || status.isStdoutTruncated) return undefined
+    const out = new Map<string, string>()
+    for (const entry of status.stdout.split('\0')) {
+      if (entry.length > 3) out.set(`${root}/${entry.slice(3)}`, entry.slice(0, 2))
+    }
+
+    return out.size > MAX_SHELL_FILES ? undefined : out
+  } catch {
+    return undefined
+  }
+}
+
+/** A file's text, unless it is past MAX_SHELL_BYTES or binary: not worth a diff. */
+async function shellText($: EngineInterface, path: string): Promise<string | undefined> {
+  const stat = await statOf($, path)
+  if (!stat || stat.size > MAX_SHELL_BYTES) return undefined
+  const text = await readText($, path)
+
+  return text === undefined || text.includes('\0') ? undefined : text
+}
+
+type ShellBefore = {
+  changes: Map<string, string>
+  /** Files already changed before the command and not on the list: their text then. */
+  texts: Map<string, string>
+}
+
+/** Before a shell command: what git calls changed, and the text of those files the list does not have. */
+async function shellBefore($: EngineInterface): Promise<ShellBefore | undefined> {
+  if (!cwd) cwd = await $.session.cwd()
+  const changes = await gitChanges($, cwd)
+  if (!changes) return undefined
+  const listed = new Set((await read($, files)).map(f => f.path))
+  const texts = new Map<string, string>()
+  let bytes = 0
+  for (const path of changes.keys()) {
+    if (listed.has(path) || bytes > MAX_SHELL_TOTAL) continue
+    const text = await shellText($, path)
+    if (text === undefined) continue
+    texts.set(path, text)
+    bytes += text.length
+  }
+
+  return { changes, texts }
+}
+
+/**
+ * After a shell command: each file it changed goes on the list. A file clean
+ * before it was as HEAD has it; an untracked one is new; one changed already
+ * is compared with its text before the command.
+ */
+async function shellAfter($: EngineInterface, before: ShellBefore): Promise<void> {
+  const changes = await gitChanges($, cwd)
+  if (!changes) return
+  const listed = new Set((await read($, files)).map(f => f.path))
+  for (const [path, status] of changes) {
+    if (listed.has(path) || status.includes('D')) continue
+    const was = before.changes.get(path)
+    if (was !== undefined && !before.texts.has(path)) continue
+    const after = await shellText($, path)
+    if (after === undefined) continue
+    const base = was !== undefined ? before.texts.get(path)! : status === '??' ? '' : await headOf($, path)
+    if (base === null || base === after) continue
+    await record($, path, base, after, was === undefined && base === '')
   }
 }
 
@@ -199,7 +322,38 @@ async function track(
   const ran = await run()
   if (ran.deny !== undefined || ran.isError) return
   const after = await readText($, path)
-  if (after === undefined) return
+  if (after !== undefined) await record($, path, before, after)
+}
+
+/** Runs a file tool's call once, whatever keeping track of it around the call does. */
+async function tracked<R extends { deny?: string; isError?: true }>(
+  $: EngineInterface,
+  path: string,
+  next: () => Promise<R>,
+): Promise<R> {
+  let ran: R | undefined
+  try {
+    await track($, path, async () => (ran = await next()))
+  } catch {
+    // Keeping track is a courtesy: the call itself stands, and runs once.
+  }
+
+  return ran ?? next()
+}
+
+/**
+ * Puts a change on the list: `after` is the file's text now, `before` its text
+ * before the change, or undefined for a file already listed in this turn.
+ */
+async function record(
+  $: EngineInterface,
+  path: string,
+  before: string | undefined,
+  after: string,
+  isNew = before === undefined,
+): Promise<void> {
+  const turn = await read($, turnId)
+  const known = (await read($, files)).find(f => f.path === path)
   const stat = (await statOf($, path)) ?? { mtimeMs: 0, size: 0 }
   if (!cwd) cwd = await $.session.cwd()
 
@@ -231,7 +385,7 @@ async function track(
           base: before ?? '',
           disk: after,
           rev: 1,
-          isNew: before === undefined,
+          isNew,
           conflict: false,
           isDeleted: false,
           isExpanded: false,
@@ -331,6 +485,7 @@ async function clearAll($: EngineInterface): Promise<void> {
   await update($, comments, () => [])
   await update($, composing, () => null)
   await update($, commands, () => ({}))
+  await update($, windows, () => ({}))
 }
 
 /** Clears at once, or asks first when there are unsaved edits to lose. */
@@ -350,6 +505,21 @@ const isViewedNow = async ($: EngineInterface, f: TrackedFile) =>
 /** Past the last change of a file (or before the first): on to the next file not marked viewed. */
 async function moveFile($: EngineInterface, path: string, dir: 1 | -1): Promise<void> {
   const order = sorted(await read($, files))
+  const at = order.find(f => f.path === path)
+  const kept = (await read($, windows))[path]
+  if (at && kept) {
+    // A file by parts: first the part with its next change.
+    const mode = await read($, baseMode)
+    const base = baseOf(at, mode, await read($, turnId))
+    const text = await textNow($, at)
+    const w = windowOf(at, text, base, mode, kept)
+    const next = w && windowAtChange(base, text, w, dir)
+    if (next) {
+      await update($, windows, ws => ({ ...ws, [path]: next }))
+      await sendCommand($, path, dir > 0 ? 'first' : 'last')
+      return
+    }
+  }
   for (let n = order.findIndex(f => f.path === path) + dir; n >= 0 && n < order.length; n += dir) {
     const f = order[n]!
     if (await isViewedNow($, f)) continue
@@ -474,19 +644,19 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
-    let ran: Awaited<ReturnType<typeof next>> | undefined
-    await track($, e.file_path, async () => (ran = await next(e)))
+  on('tool.call', { tool: 'Edit' }, ($, e, next) => tracked($, e.file_path, () => next(e)))
+  on('tool.call', { tool: 'Write' }, ($, e, next) => tracked($, e.file_path, () => next(e)))
+  on('tool.call', { tool: 'NotebookEdit' }, ($, e, next) => tracked($, e.notebook_path, () => next(e)))
 
-    return ran ?? next(e)
-  }).catch(($, e, next) => next(e))
+  // A shell command's changes, as git sees them; one in the background finishes too late to tell.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (e.run_in_background) return next(e)
+    const before = await shellBefore($).catch(() => undefined)
+    const ran = await next(e)
+    if (before) await shellAfter($, before).catch(() => {})
 
-  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
-    let ran: Awaited<ReturnType<typeof next>> | undefined
-    await track($, e.file_path, async () => (ran = await next(e)))
-
-    return ran ?? next(e)
-  }).catch(($, e, next) => next(e))
+    return ran
+  })
 
   // The surface could not draw an editor's rows: draw fewer of them, in a new instance.
   on('ui.fault', async ($, e, next) => {
@@ -526,8 +696,28 @@ export const register: Register = on => {
 
     if (post.focusSeq > last.focusSeq) await update($, active, () => post.path)
     const draft = (await read($, drafts))[post.path]
-    if (post.isDirty ? draft !== post.text : draft !== undefined) {
-      await update($, drafts, d => (post.isDirty ? { ...d, [post.path]: post.text } : without(d, post.path)))
+    // A file by parts: the editor's text goes back in place of its part.
+    let text: string | undefined = post.text
+    let isDirty = post.isDirty
+    const mode = await read($, baseMode)
+    const base = baseOf(file, mode, await read($, turnId))
+    const before = draft ?? file.disk
+    const kept = (await read($, windows))[post.path]
+    const w = windowOf(file, before, base, mode, kept)
+    if (w) {
+      text = undefined
+      if (e.element === windowKey(file.id, w)) {
+        const back = spliceBack(before, w, post.text)
+        text = back.text
+        isDirty = text !== file.disk
+        if (w !== kept || back.lines !== w.lines) {
+          await update($, windows, ws => ({ ...ws, [post.path]: { ...w, lines: back.lines } }))
+        }
+      }
+    }
+    if (text !== undefined && (isDirty ? draft !== text : draft !== undefined)) {
+      const now = text
+      await update($, drafts, d => (isDirty ? { ...d, [post.path]: now } : without(d, post.path)))
     }
     const command = (await read($, commands))[post.path]
     if (command && command.seq === post.cmdSeq) await update($, commands, c => without(c, post.path))
@@ -537,7 +727,7 @@ export const register: Register = on => {
       if (!copied.isCopied) $.ui.toast('Could not copy to the clipboard')
     }
     if (post.saveSeq > last.saveSeq) {
-      if (post.isDirty) await save($, post.path, post.text)
+      if (text !== undefined && isDirty) await save($, post.path, text)
       else $.ui.toast(`${file.display}: nothing to save`)
     }
     if (post.commentSeq > last.commentSeq) await startComment($, post.path, post.sel)
@@ -593,6 +783,7 @@ export const register: Register = on => {
     const writingOn = await read($, composing)
     const asked = await read($, commands)
     const budgetOf = await read($, budgets)
+    const parts = await read($, windows)
     const isDark = await isDarkTheme($)
     const selected = list.find(f => f.path === picked) ?? list[0]
     const dirtyCount = list.filter(f => unsaved[f.path] !== undefined).length
@@ -607,6 +798,7 @@ export const register: Register = on => {
     const remove = (path: string) => async () => {
       await update($, files, l => l.filter(f => f.path !== path))
       await update($, drafts, d => without(d, path))
+      await update($, windows, ws => without(ws, path))
     }
     const setMode = async (next: BaseMode) => {
       await update($, baseMode, () => next)
@@ -615,9 +807,12 @@ export const register: Register = on => {
 
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
-    // The surfaces that run a surface module; another gets the list and the buttons alone.
-    const Client = 'Client' in elements ? elements.Client : undefined
-    const Input = 'Input' in elements ? elements.Input : undefined
+    // Without a surface module the files are buttons and the diff is read-only.
+    // The terminal and the desktop app run surface modules; the mobile app draws neither them nor fields.
+    const isEditing = e.surface === 'terminal' || e.surface === 'desktop'
+    const Client = isEditing && 'Client' in elements ? elements.Client : undefined
+    const Code = 'Code' in elements ? elements.Code : undefined
+    const Input = isEditing && 'Input' in elements ? elements.Input : undefined
     const isApp = e.surface !== 'terminal'
     const tint = {
       neutral: isDark ? '#ffffff14' : '#0000000f',
@@ -644,7 +839,7 @@ export const register: Register = on => {
         <Box flexDirection="column" alignItems="center" paddingY={2}>
           <Text color="success">✓</Text>
           <Text weight="semibold">No changes yet</Text>
-          <Text dimColor>Files Claude changes with Edit or Write will show up here.</Text>
+          <Text dimColor>Files Claude changes will show up here.</Text>
         </Box>
       )
     }
@@ -786,18 +981,30 @@ export const register: Register = on => {
       isViewed: isViewed(f),
     }))
 
+    /** The part of the file its editor holds, when it goes by parts. */
+    const partCache = new Map<string, FileWindow | undefined>()
+    const partOf = (f: TrackedFile) => {
+      if (!partCache.has(f.path)) partCache.set(f.path, windowOf(f, textOf(f), baseFor(f), mode, parts[f.path]))
+      return partCache.get(f.path)
+    }
+
     const editor = (f: TrackedFile) => {
       if (!Client) return null
-      const text = textOf(f)
-      const base = baseFor(f)
-      const key = `file-${f.id}`
+      const whole = textOf(f)
+      const wholeBase = baseFor(f)
+      const w = partOf(f)
+      const { text, base } = w ? slices(wholeBase, whole, w) : { text: whole, base: wholeBase }
+      const key = w ? windowKey(f.id, w) : `file-${f.id}`
       const props = {
         file: f.path,
         text,
         patch: makePatch(base, text),
         rev: f.rev,
-        baseKey: `${mode}:${fingerprint(base)}`,
-        diskHash: fingerprint(f.disk),
+        baseKey: `${mode}:${fingerprint(wholeBase)}${w ? `:${w.baseLine}:${w.baseLines}` : ''}`,
+        // By parts, whether the file has unsaved edits is told by the whole text.
+        diskHash: w ? '' : fingerprint(f.disk),
+        firstLine: w?.line ?? 0,
+        firstBaseLine: w?.baseLine ?? 0,
         conflict: f.conflict,
         expanded: f.isExpanded,
         isSplit: split,
@@ -808,7 +1015,7 @@ export const register: Register = on => {
         isDark,
         notes: notes.filter(c => c.path === f.path).map((c): [number, number] => [c.from, c.to]),
         command: asked[f.path] ?? null,
-        budget: budgetOf[key] ?? BUDGET,
+        budget: budgetOf[`file-${f.id}`] ?? BUDGET,
       }
       if (JSON.stringify(props).length > MAX_PROPS) {
         return f === selected ? (
@@ -876,6 +1083,12 @@ export const register: Register = on => {
     )
 
     const canRevert = base !== textOf(f) && base !== ''
+    const part = Client ? partOf(f) : undefined
+    const movePart = (x: TrackedFile, dir: 1 | -1) => async () => {
+      const w = partOf(x)
+      const next = w && shiftWindow(baseFor(x), textOf(x), w, dir)
+      if (next) await update($, windows, ws => ({ ...ws, [x.path]: next }))
+    }
     const tools = (
       <Box flexDirection="row" alignItems="center" justifyContent="space-between" gap={1} flexWrap="wrap">
         <Box flexDirection="row" alignItems="center" gap={1}>
@@ -905,7 +1118,8 @@ export const register: Register = on => {
                 variant="secondary"
                 onPress={async () => {
                   await sendCommand($, f.path, 'find')
-                  void $.ui.focus({ requestId: PANE, key: `file-${f.id}` }).catch(() => {})
+                  const w = partOf(f)
+                  void $.ui.focus({ requestId: PANE, key: w ? windowKey(f.id, w) : `file-${f.id}` }).catch(() => {})
                 }}
               />
               <Button
@@ -914,6 +1128,20 @@ export const register: Register = on => {
                 variant="secondary"
                 onPress={() => startComment($, f.path)}
               />
+            </Box>
+          ) : null}
+          {part ? (
+            <Box flexDirection="row" alignItems="center" gap={1}>
+              <Text dimColor tabular>
+                Lines {part.line + 1}–{part.line + part.lines} of {splitLines(textOf(f)).length}
+              </Text>
+              {part.line > 0 || part.baseLine > 0 ? (
+                <Button key={`earlier-${f.id}`} label="↑ Earlier part" variant="secondary" onPress={movePart(f, -1)} />
+              ) : null}
+              {part.line + part.lines < splitLines(textOf(f)).length ||
+              part.baseLine + part.baseLines < splitLines(base).length ? (
+                <Button key={`later-${f.id}`} label="↓ Later part" variant="secondary" onPress={movePart(f, 1)} />
+              ) : null}
             </Box>
           ) : null}
           <Button
@@ -958,6 +1186,26 @@ export const register: Register = on => {
             />
           </Box>
           <Button key="comment-cancel" label="Cancel" onPress={() => update($, composing, () => null)} />
+        </Box>
+      ) : null
+
+    const plain =
+      Client || !Code
+        ? undefined
+        : unifiedDiff(diffLines(splitLines(base), splitLines(textOf(f)), { ignoreWhitespace: ws }), MAX_PLAIN_DIFF)
+    const plainDiff =
+      plain && Code ? (
+        <Box key="plain-diff" flexDirection="column" gap={1}>
+          {plain.text ? (
+            <Code key={`code-${f.id}`} source={plain.text} format="diff" path={f.path} />
+          ) : (
+            <Text dimColor>No changes against {MODES.find(m => m.mode === mode)!.label.toLowerCase()}.</Text>
+          )}
+          {plain.shown < plain.hunks ? (
+            <Text dimColor>
+              {plain.shown} of {plain.hunks} changes shown: the rest are in the terminal and the desktop app.
+            </Text>
+          ) : null}
         </Box>
       ) : null
 
@@ -1009,6 +1257,8 @@ export const register: Register = on => {
               .filter(x => (x === selected && !isFileViewed) || unsaved[x.path] !== undefined)
               .map(x => (x === selected && isFileViewed ? null : editor(x)))}
           </Box>
+        ) : !isFileViewed ? (
+          plainDiff
         ) : null}
       </Box>
     )
@@ -1017,6 +1267,25 @@ export const register: Register = on => {
     const isWide = columns >= 90
     const sideWidth = Math.max(26, Math.min(44, Math.floor(columns * 0.28)))
     const viewedCount = rows.filter(r => r.isViewed).length
+    // Where no surface module runs: the files as buttons.
+    const plainList =
+      !Client && list.length > 1 ? (
+        <Box key="file-list" flexDirection="column" gap={1}>
+          <Text dimColor weight="semibold">
+            CHANGED FILES{viewedCount ? ` · ${viewedCount}/${rows.length} VIEWED` : ''}
+          </Text>
+          <Box flexDirection="row" gap={1} flexWrap="wrap">
+            {order.map((x, n) => (
+              <Button
+                key={`pick-${x.id}`}
+                label={`${rows[n]!.isViewed ? '✓ ' : ''}${rows[n]!.name} +${rows[n]!.added} −${rows[n]!.removed}`}
+                variant={x === f ? 'primary' : 'secondary'}
+                onPress={() => update($, active, () => x.path)}
+              />
+            ))}
+          </Box>
+        </Box>
+      ) : null
     const fileList =
       Client && (isWide || list.length > 1) ? (
         <Box
@@ -1047,8 +1316,8 @@ export const register: Register = on => {
         {options}
         {confirm}
         {review}
-        <Box flexDirection={isWide ? 'row' : 'column'} gap={1}>
-          {fileList}
+        <Box flexDirection={isWide && Client ? 'row' : 'column'} gap={1}>
+          {fileList ?? plainList}
           {detail}
         </Box>
       </Box>

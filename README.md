@@ -33,7 +33,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 
 ### Changed files list
 
-- Every file Claude touched with Edit or Write, sorted by path, with its status (`A` added, `M` modified, `D` deleted), its folder, its `+N −N` counts, a dot for unsaved edits and a ✓ for files marked viewed.
+- Every file Claude changed, sorted by path, with its status (`A` added, `M` modified, `D` deleted), its folder, its `+N −N` counts, a dot for unsaved edits and a ✓ for files marked viewed.
 - Pick a file with a click, or with the arrow keys once the list has the focus.
 - The header counts how many files are viewed: `CHANGED FILES · 1/4 VIEWED`.
 - **Remove from list** forgets one file; the file on disk stays as it is.
@@ -51,6 +51,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
   - **Git HEAD**: the file as committed. A file not yet committed compares with an empty one; outside a git repository the panel says so and uses the session start.
 - **Long lines wrap** to the width of the panel instead of running off its edge.
 - **Large diffs stay fast.** About 100 lines are drawn at a time, fewer when the lines are long. **Show next 50 lines** / **Show previous 50 lines** move the window, and so does the cursor.
+- **Large files by parts.** A file too large to hand to the editor whole (about 90,000 characters with its diff) is edited a part at a time, around its first change: **Lines 1–2000 of 12000**, with **↑ Earlier part** / **↓ Later part**, and F7 moves on to the part with the next change. Line numbers are the file's, and Save writes the whole file.
 - **Stats.** The file's `+N −N` and GitHub's five squares, the share of added and removed lines.
 
 ### Editing in place
@@ -75,10 +76,15 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 
 ### In sync with the disk
 
+- **Not only Edit and Write.** Notebook edits show like any other. In a git repository, files a shell command of Claude's changes show too: against HEAD, as new, or against the text before the command when they already had changes.
 - Changes made in another editor, by git or by a script show up within a second.
 - A file changed back to how it was before Claude drops off the list.
 - If a file changes on disk while you have unsaved edits in it, the panel asks whether to **Take the disk version** or **Keep mine**.
 - A file deleted from disk is marked so; Save creates it again.
+
+### On the phone
+
+The mobile app draws no editor: the files are buttons, and the diff of the one picked shows read-only, in unified form with its `@@` hunks.
 
 Syntax colours cover JavaScript/TypeScript, Python, Go, Rust, C/C++/Java/C#/Swift/Kotlin, shell, Ruby, YAML, TOML, JSON, CSS, SQL, HTML/XML and Markdown.
 
@@ -129,7 +135,10 @@ The editor takes the keys once you click in it.
 
 ## How it works
 
-- The mod wraps Claude's Edit and Write tool calls. Before the first edit of a file it keeps the file's text: the session-start base, until the list is cleared. Before the first edit of a file in each turn it keeps the text again: the last-turn base.
+- The mod wraps Claude's Edit, Write and NotebookEdit tool calls. Before the first edit of a file it keeps the file's text: the session-start base, until the list is cleared. Before the first edit of a file in each turn it keeps the text again: the last-turn base.
+- Around each Bash call in a git repository it asks `git status` which files are changed, before and after. A file the command changed is listed, against the text it had before the command if it already had changes, else against HEAD (or as new when untracked). Files over 1 MB, binary files and deletions are left out.
+- The diff is Myers' algorithm, the one git uses; a very large one is first split on lines found once on each side.
+- A file too large to hand to the editor whole goes to it a part at a time; an edit in the part is put back in its place in the whole text.
 - **Git HEAD** reads the committed file with `git cat-file blob HEAD:<file>`, again every few seconds so a commit shows up. A file not yet committed compares with an empty one.
 - Review comments go to Claude as a user message.
 - Every second it checks the tracked files' size and modification time and reads any that changed.
@@ -142,10 +151,11 @@ The editor takes the keys once you click in it.
 The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built or downloaded.
 
 - **Network:** none.
-- **Reads** the files Claude edits or writes, before and after each edit, and checks their size and modification time every second.
+- **Reads** the files Claude edits or writes, before and after each edit, and checks their size and modification time every second. Around a shell command in a git repository it reads the files git lists as changed (up to 2,000 files of 1 MB each).
 - **Writes** a file only when you press **Save**, **Save all** or Cmd/Ctrl+S, and only a file on the list.
-- **Runs** a program only for **Compare with: Git HEAD** and **Open in editor**, with fixed arguments and no shell:
-  - `git -C <folder> rev-parse --is-inside-work-tree` and `git -C <folder> cat-file blob HEAD:./<file>`, which only read: no hook, filter or pager runs;
+- **Runs** a program only for **Compare with: Git HEAD**, around Claude's shell commands and for **Open in editor**, with fixed arguments and no shell:
+  - `git -C <folder> rev-parse` and `git -C <folder> cat-file blob HEAD:./<file>`, which only read: no hook, filter or pager runs;
+  - `git -C <folder> status --porcelain -z`, before and after a shell command of Claude's, with optional locks and fsmonitor off. Like any `git status`, it can run the repository's clean filters (Git LFS, say) on files whose timestamps changed;
   - `code -g`, `cursor -g`, `zed` or `subl` with `<file>:<line>`, or on macOS `open -t <file>`. Never the file's default app, which for a script or an app bundle would run it.
 - **Tells Claude** only what you send: a note that you saved a file, so it reads the file again, and your review comments when you press **Send to Claude** or **Put in prompt**. Quoted lines sit in a code fence their own text cannot close.
 - **Copies** to the clipboard only on Cmd/Ctrl+C or X.
@@ -154,12 +164,12 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 
 ## Limitations
 
-- Editing works in the terminal and the desktop app. Other surfaces show the file list and buttons only.
-- Only Edit and Write are tracked. Files changed by shell commands are not picked up.
-- A file too large to hand to the editor (about 95,000 characters with its diff) is listed, but has to be edited elsewhere: **Open in editor**.
+- Editing works in the terminal and the desktop app; the mobile app shows the diff read-only.
+- Shell commands are tracked only in a git repository and only when they finish before Claude goes on: not those run in the background. Files they delete are not listed.
+- A single line too long to hand to the editor (about 90,000 characters) has to be edited elsewhere: **Open in editor**.
 - A surface draws a limited tree, so the editor draws about 100 rows of a diff at a time, fewer for long lines. If a surface still cannot draw them, the editor tries again with half as many.
 - Keys go to the editor only after a click in it, and some hosts keep F7 or Cmd+F for themselves: the buttons do the same.
-- Very large rewrites (over 2 million line pairs) are drawn as one removed block followed by one added block.
+- A diff past ten million steps of work, rare outside generated files, is drawn as one removed block followed by one added block.
 
 ## Development
 
@@ -191,6 +201,7 @@ The type definitions in `.claude-plugin/types/` are generated by Claude Code whe
 | `hooks/editor.tsx` | The diff editor: layout, input, drawing |
 | `hooks/files.tsx` | The changed files list |
 | `hooks/diff.ts` | Line diff, word ranges, patches |
+| `hooks/window.ts` | The parts of a file too large for the editor |
 | `hooks/highlight.ts` | Syntax highlighting |
 | `types/index.d.ts` | The mod's state types |
 

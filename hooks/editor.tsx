@@ -60,6 +60,10 @@ export type EditorProps = {
   command: EditorCommand | null
   /** What the drawn rows may serialize to. */
   budget: number
+  /** Where `text` starts in the file, 0-based, when it is a part of a file too large to hand over whole. */
+  firstLine: number
+  /** Where the base `patch` gives starts in the base. */
+  firstBaseLine: number
 }
 
 type Pos = { row: number; col: number }
@@ -366,10 +370,11 @@ function selection(m: Model): [Pos, Pos] | null {
 /** The lines the selection covers, or the cursor's line: 1-based, inclusive. */
 function selectedLines(m: Model): [number, number] {
   const sel = selection(m)
-  if (!sel) return [m.cur.row + 1, m.cur.row + 1]
+  const at = m.props.firstLine + 1
+  if (!sel) return [m.cur.row + at, m.cur.row + at]
   const last = sel[1].col === 0 && sel[1].row > sel[0].row ? sel[1].row - 1 : sel[1].row
 
-  return [sel[0].row + 1, last + 1]
+  return [sel[0].row + at, last + at]
 }
 
 function textBetween(m: Model, a: Pos, b: Pos): string {
@@ -463,7 +468,7 @@ function redraw(m: Model): void {
 }
 
 /** "@@ -a,b +c,d @@" for the rows shown from row `start` up to the next gap. */
-function hunkHeader(rows: readonly Row[], shown: Uint8Array, start: number): string {
+function hunkHeader(m: Model, rows: readonly Row[], shown: Uint8Array, start: number): string {
   let oldStart = 0
   let newStart = 0
   let oldCount = 0
@@ -480,7 +485,10 @@ function hunkHeader(rows: readonly Row[], shown: Uint8Array, start: number): str
     }
   }
 
-  return `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`
+  const old = oldStart ? oldStart + m.props.firstBaseLine : 0
+  const now = newStart ? newStart + m.props.firstLine : 0
+
+  return `@@ -${old},${oldCount} +${now},${newCount} @@`
 }
 
 /** The rows shown, side by side: unchanged rows face themselves, a change's removed rows its added ones. */
@@ -521,7 +529,7 @@ function layout(m: Model): void {
   if (m.isActive && cursorK >= 0) pinned.add(cursorK)
   const visible = m.props.expanded ? rows.map((_, k) => k) : visibleRows(rows, pinned)
 
-  m.numW = String(Math.max(1, m.lines.length, m.base.length)).length
+  m.numW = String(Math.max(1, m.lines.length + m.props.firstLine, m.base.length + m.props.firstBaseLine)).length
   const columns = m.surface.columns
   const side = m.numW + 1
   const half = Math.floor((columns - 2 * side) / 2)
@@ -569,7 +577,7 @@ function layout(m: Model): void {
   for (; end < units.length && end < m.win + WINDOW; end++) {
     const u = units[end]!
     const lo = loOf(u)
-    if (lo > last + 1) items.push({ kind: 'gap', from: last + 1, to: lo, header: hunkHeader(rows, shown, lo) })
+    if (lo > last + 1) items.push({ kind: 'gap', from: last + 1, to: lo, header: hunkHeader(m, rows, shown, lo) })
     const blockTo = blockEnd.get(lo)
     const block: [number, number] | undefined = blockTo === undefined ? undefined : [lo, blockTo]
     // A change's first row keeps room at its right end for the Revert label.
@@ -1182,7 +1190,8 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
   const matches = m.find ? matchesOf(m) : []
   const matchesOn = new Map<number, Match[]>()
   for (const x of matches) matchesOn.set(x.row, [...(matchesOn.get(x.row) ?? []), x])
-  const isNoted = (r: number) => props.notes.some(([a, b]) => r + 1 >= a && r + 1 <= b)
+  const isNoted = (r: number) =>
+    props.notes.some(([a, b]) => r + 1 + props.firstLine >= a && r + 1 + props.firstLine <= b)
 
   const inSelection = (row: number, col: number) => {
     if (!sel) return false
@@ -1275,8 +1284,9 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
 
   const numberOf = (seg: Seg | undefined, side: 'oldNo' | 'newNo') => {
     const no = seg?.first ? rows[seg.k]![side] : 0
+    const first = side === 'oldNo' ? props.firstBaseLine : props.firstLine
 
-    return pad(no > 0 ? String(no) : '', numW)
+    return pad(no > 0 ? String(no + first) : '', numW)
   }
 
   const drawLine = (item: Extract<Item, { kind: 'line' }>, n: number) => {

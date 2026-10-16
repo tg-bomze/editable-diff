@@ -565,7 +565,7 @@ export const register: Register = on => {
           {dirty > 0 ? <Text color="warning"> · {dirty} unsaved</Text> : ''}
         </Text>
         <Button key="open-pane" label="Open panel" variant="secondary" onPress={() => void openPane($)} />
-        <Button key="band-clear" label="Clear" variant="secondary" onPress={() => askClear($)} />
+        <Button key="band-clear" label="Clear these diffs" variant="secondary" onPress={() => askClear($)} />
       </Box>
     )
   })
@@ -672,7 +672,7 @@ export const register: Register = on => {
         </Box>
         <Box flexDirection="row" gap={1}>
           {dirtyCount > 1 ? <Button key="save-all" label="Save all" variant="primary" onPress={saveAll} /> : null}
-          <Button key="clear" label="Clear" variant="secondary" onPress={() => askClear($)} />
+          <Button key="clear" label="Clear these diffs" variant="secondary" onPress={() => askClear($)} />
         </Box>
       </Box>
     )

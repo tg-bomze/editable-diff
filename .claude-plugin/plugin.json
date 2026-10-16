@@ -6,6 +6,7 @@
     "name": "Denis Malimonov"
   },
   "repository": "https://github.com/tg-bomze/editable-diff",
+  "license": "MIT",
   "keywords": [
     "diff",
     "editor",

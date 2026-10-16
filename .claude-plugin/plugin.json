@@ -1,7 +1,16 @@
 {
   "name": "editable-diff",
   "version": "0.1.0",
-  "description": "Панель с правками Claude: зелёный/красный diff с контекстом, правка прямо в панели и сохранение в файл",
-  "author": { "name": "Denis Malimonov" },
+  "description": "A panel with Claude's edits: a GitHub Desktop-style diff you can edit in place and save",
+  "author": {
+    "name": "Denis Malimonov"
+  },
+  "repository": "https://github.com/tg-bomze/editable-diff",
+  "keywords": [
+    "diff",
+    "editor",
+    "review",
+    "panel"
+  ],
   "types": "./types/index.d.ts"
 }

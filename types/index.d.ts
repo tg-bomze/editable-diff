@@ -8,18 +8,25 @@ export type TrackedFile = {
   display: string
   /** The file's text before Claude's first edit ('' for a file Claude created). */
   base: string
-  /** The file's text on disk as of Claude's last edit or the person's last save. */
+  /** The file's text on disk as last read: after Claude's edit, a save, or a change made elsewhere. */
   disk: string
-  /** Bumped whenever the editor must take `disk` afresh (Claude edited, edits discarded). */
+  /** Bumped whenever the editor must take its text afresh (the file changed, edits discarded). */
   rev: number
   /** Claude created the file. */
   isNew: boolean
-  /** Claude changed the file on disk while the person had unsaved edits in it. */
+  /** The file changed on disk while the person had unsaved edits in it. */
   conflict: boolean
+  /** The file is gone from disk. */
+  isDeleted: boolean
+  /** Show the whole file, not only the changes. */
+  isExpanded: boolean
+  /** The file's modification time and size as last read, to notice changes made elsewhere. */
+  mtimeMs: number
+  size: number
 }
 
 /** The counters an editor instance last posted. */
-export type Counters = { saveSeq: number; discardSeq: number; keepSeq: number }
+export type Counters = { saveSeq: number; copySeq: number; focusSeq: number }
 
 /** Unsaved edits, by absolute path: the editor's whole text. */
 export type Drafts = Record<string, string>
@@ -32,9 +39,14 @@ export type EditorPost = {
   text: string
   isDirty: boolean
   saveSeq: number
-  discardSeq: number
-  keepSeq: number
+  copySeq: number
+  focusSeq: number
+  /** What the last copy or cut took. */
+  clip: string
 }
+
+/** What the file list posts: the file the person picked. */
+export type FilesPost = { select: string; seq: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -44,6 +56,9 @@ declare module 'claude-code' {
       nextId: number
       isConfirmingClear: boolean
       seen: Record<string, Counters>
+      /** The file shown in the pane (picked in the list); the first file when it names none. */
+      active: string
+      isPaneOpen: boolean
     }
   }
 }

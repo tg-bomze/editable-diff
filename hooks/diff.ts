@@ -39,9 +39,7 @@ export function diffLines(a: readonly string[], b: readonly string[]): Row[] {
     for (let i = n - 1; i >= 0; i--) {
       for (let j = m - 1; j >= 0; j--) {
         t[i * w + j] =
-          a[start + i] === b[start + j]
-            ? t[(i + 1) * w + j + 1]! + 1
-            : Math.max(t[(i + 1) * w + j]!, t[i * w + j + 1]!)
+          a[start + i] === b[start + j] ? t[(i + 1) * w + j + 1]! + 1 : Math.max(t[(i + 1) * w + j]!, t[i * w + j + 1]!)
       }
     }
     let i = 0
@@ -60,16 +58,16 @@ export function diffLines(a: readonly string[], b: readonly string[]): Row[] {
       }
     }
     // Within a change, show the removed lines above the added ones.
-    return [...rows.slice(0, start), ...groupChanges(rows.slice(start)), ...suffix(a, b, endA, endB)]
+    return [...rows.slice(0, start), ...groupChanges(rows.slice(start)), ...suffix(b, endA, endB)]
   }
 
   for (let i = start; i < endA; i++) rows.push({ kind: 'del', text: a[i]!, oldNo: i + 1, newNo: 0 })
   for (let j = start; j < endB; j++) rows.push({ kind: 'add', text: b[j]!, oldNo: 0, newNo: j + 1 })
 
-  return [...rows, ...suffix(a, b, endA, endB)]
+  return [...rows, ...suffix(b, endA, endB)]
 }
 
-function suffix(a: readonly string[], b: readonly string[], endA: number, endB: number): Row[] {
+function suffix(b: readonly string[], endA: number, endB: number): Row[] {
   const rows: Row[] = []
   for (let k = 0; endB + k < b.length; k++) {
     rows.push({ kind: 'ctx', text: b[endB + k]!, oldNo: endA + k + 1, newNo: endB + k + 1 })
@@ -108,6 +106,60 @@ export function countChanges(rows: readonly Row[]): { added: number; removed: nu
   }
 
   return { added, removed }
+}
+
+const isWordChar = (c: string | undefined) => c !== undefined && /[\p{L}\p{N}_$]/u.test(c)
+
+/**
+ * The changed span inside each removed line paired with an added one (the
+ * i-th removed line of a change with its i-th added line), by row index, as
+ * [start, end) in the row's text. Lines with nothing in common get no span.
+ */
+export function wordRanges(rows: readonly Row[]): Map<number, [number, number]> {
+  const out = new Map<number, [number, number]>()
+  let k = 0
+  while (k < rows.length) {
+    if (rows[k]!.kind === 'ctx') {
+      k++
+      continue
+    }
+    const dels: number[] = []
+    const adds: number[] = []
+    while (k < rows.length && rows[k]!.kind !== 'ctx') {
+      ;(rows[k]!.kind === 'del' ? dels : adds).push(k)
+      k++
+    }
+    for (let i = 0; i < Math.min(dels.length, adds.length); i++) {
+      const a = rows[dels[i]!]!.text
+      const b = rows[adds[i]!]!.text
+      let start = 0
+      while (start < a.length && start < b.length && a[start] === b[start]) start++
+      let endA = a.length
+      let endB = b.length
+      while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+        endA--
+        endB--
+      }
+      // Whole words, as GitHub marks them: `let` → `const` marks both words, not `le` and `cons`.
+      while (start > 0 && isWordChar(a[start - 1]) && (isWordChar(a[start]) || isWordChar(b[start]))) start--
+      while (
+        endA < a.length &&
+        endB < b.length &&
+        isWordChar(a[endA]) &&
+        (isWordChar(a[endA - 1]) || isWordChar(b[endB - 1]))
+      ) {
+        endA++
+        endB++
+      }
+      // Only worth marking when the lines share a good part.
+      const kept = start + (a.length - endA)
+      if (kept * 3 < Math.max(a.length, b.length)) continue
+      if (endA > start) out.set(dels[i]!, [start, endA])
+      if (endB > start) out.set(adds[i]!, [start, endB])
+    }
+  }
+
+  return out
 }
 
 /** Indices of the rows to show: every change, CONTEXT rows around it, and `pinned` rows. */

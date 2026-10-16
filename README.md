@@ -1,37 +1,109 @@
 # editable-diff
 
-Мод для Claude Code: панель «Правки» со всеми файлами, которые Claude изменил через Edit или Write.
+A [Claude Code](https://claude.com/claude-code) mod that collects every file Claude changes into one panel and shows each as a diff you can edit in place, laid out like GitHub Desktop.
 
-- зелёный/красный diff против версии до первой правки Claude, с 5 строками контекста вокруг изменений;
-- правка прямо в панели: клик по строке, набор текста, Ctrl/Cmd+Z, Ctrl/Cmd+S;
-- «Сохранить» пишет файл на диск и сообщает Claude, что файл нужно перечитать;
-- если Claude меняет файл, пока у вас несохранённые правки, панель предлагает взять его версию или оставить свою;
-- «Очистить буфер» убирает список (файлы на диске не трогает).
+Review what Claude did, fix a line or two right in the diff, press Save, and Claude is told to re-read the file before its next edit.
 
-Панель открывается сама при первой правке Claude или командой `/editable-diff`.
+## Features
 
-## Установка
+- **Changed files list.** Every file Claude touched with Edit or Write, with its status (`A` added, `M` modified, `D` deleted), folder, `+N −N` counts and a dot for unsaved edits. Pick one with a click or the arrow keys.
+- **GitHub-style diff.** Against the file as it was before Claude's first edit: old and new line numbers, `@@` hunk headers, tinted lines with the changed words marked, syntax colours, 5 lines of context. Click a hunk header to show the lines it hides, or switch to **Whole file**.
+- **Edit in place.** A real cursor, mouse selection (drag, double-click a word, triple-click a line), Shift+arrows, undo/redo, copy/cut/paste, indenting. Long lines wrap.
+- **Large diffs stay fast.** Shown 100 lines at a time; **Show next 50 lines** / **Show previous 50 lines** move the window, and so does the cursor.
+- **Stays in sync with disk.** Changes made in another editor show up within a second. A file changed back to how it was before Claude drops off the list. If a file changes on disk while you have unsaved edits in it, the panel asks which version to keep.
+- **Out of the way.** The panel opens on Claude's first edit. While it is closed, a line above the prompt offers **Open panel** and **Clear**.
 
-В терминальной сессии Claude Code:
+Syntax colours cover JavaScript/TypeScript, Python, Go, Rust, C/C++/Java/C#/Swift/Kotlin, shell, Ruby, YAML, TOML, JSON, CSS, SQL, HTML/XML and Markdown.
+
+## Install
+
+In Claude Code:
 
 ```
 /plugin install editable-diff --marketplace tg-bomze/editable-diff
 ```
 
-Из shell:
+From a shell:
 
 ```bash
 claude plugin install editable-diff --marketplace tg-bomze/editable-diff
 ```
 
-В десктоп-приложении: «+» рядом с полем ввода → Plugins → Add marketplace `tg-bomze/editable-diff` → Add plugin.
+In the desktop app: **+** next to the prompt → **Plugins** → **Add marketplace** `tg-bomze/editable-diff` → **Add plugin**.
 
-## Разработка
+## Usage
+
+The panel, titled **Claude's edits**, opens by itself when Claude first edits a file. Reopen it with `/editable-diff` or **Open panel** above the prompt.
+
+| Action | How |
+| --- | --- |
+| Save the file | **Save**, or Cmd/Ctrl+S in the editor |
+| Save every file with edits | **Save all** |
+| Drop your unsaved edits | **Discard my edits** |
+| Put the file back as it was before Claude | **Revert to original**, then **Save** |
+| Show the whole file / only the changes | **Whole file** / **Changes only** |
+| Forget a file | **Remove from list** |
+| Forget every file | **Clear** (asks first if there are unsaved edits) |
+
+Nothing is written to disk until you save. Removing or clearing only empties the list; files on disk stay as they are.
+
+### Keys in the editor
+
+| Keys | Does |
+| --- | --- |
+| Arrows, Home/End, Page Up/Down | Move; add Shift to select |
+| Cmd/Ctrl+Left/Right, Cmd/Ctrl+Up/Down | Line start/end, file start/end |
+| Cmd/Ctrl+A | Select all |
+| Cmd/Ctrl+C / X | Copy / cut (the whole line when nothing is selected) |
+| Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y | Undo, redo |
+| Tab / Shift+Tab | Indent / outdent the selected lines |
+| Cmd/Ctrl+Backspace | Delete to the line start |
+| Cmd/Ctrl+S | Save |
+
+## How it works
+
+- The mod wraps Claude's Edit and Write tool calls. Before the first edit of a file it keeps the file's text; that is the base every diff is drawn against, until the list is cleared.
+- Every second it checks the tracked files' size and modification time and reads any that changed.
+- Saving writes the file and adds a note to the conversation, so Claude reads the file again before editing it.
+- The list lives for the session.
+- The palette follows the light or dark theme set in Claude Code.
+
+## Limitations
+
+- Editing works in the terminal and the desktop app. Other surfaces show the file list and buttons only.
+- Only Edit and Write are tracked. Files changed by shell commands are not picked up.
+- A file too large to hand to the editor (about 95,000 characters with its diff) is listed, but has to be edited elsewhere.
+- Very large rewrites (over 2 million line pairs) are drawn as one removed block followed by one added block.
+
+## Development
+
+Load the mod from a checkout:
+
+```bash
+claude --plugin-dir .
+```
+
+Validate, type-check and test:
 
 ```bash
 claude plugin validate .
 ```
 
 ```bash
+npx -y -p typescript@5.6.3 tsc -p . --noEmit
+```
+
+```bash
 claude plugin test .
 ```
+
+The type definitions in `.claude-plugin/types/` are generated by Claude Code when the mod loads.
+
+| File | Role |
+| --- | --- |
+| `hooks/register.tsx` | Tracks edits, polls the disk, saves, draws the panel and the line above the prompt |
+| `hooks/editor.tsx` | The diff editor: layout, input, drawing |
+| `hooks/files.tsx` | The changed files list |
+| `hooks/diff.ts` | Line diff, word ranges, patches |
+| `hooks/highlight.ts` | Syntax highlighting |
+| `types/index.d.ts` | The mod's state types |

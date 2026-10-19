@@ -18,13 +18,23 @@ import { countChanges, diffLines, fingerprint, makePatch, printable, splitLines,
 import { ROWS } from './files'
 import type { FileRow } from './files'
 import { languageOf } from './highlight'
-import { isTooLarge, shiftWindow, slices, spliceBack, windowAtChange, windowFor, windowKey } from './window'
+import {
+  expandGap,
+  gapsOf,
+  isTooLarge,
+  shiftWindow,
+  slices,
+  spliceBack,
+  windowAtChange,
+  windowFor,
+  windowKey,
+} from './window'
 
 const PANE = 'editable-diff'
 const TITLE = "Claude's edits"
 /** A Client's props go whole or not at all; past this the file is shown, not edited. */
 const MAX_PROPS = 95_000
-/** Past this a file's text and patch go to the editor a part at a time. */
+/** Past this a file goes to the editor as its hunks, or, shown whole, a part at a time. */
 const WINDOW_AT = MAX_PROPS - 5_000
 /** How often files are checked for changes made outside the pane. */
 const POLL_MS = 1000
@@ -39,13 +49,15 @@ const MAX_STORE = 3_500_000
 const MAX_SESSIONS = 20
 const INDEX = 'sessions'
 /** What an editor's rows may serialize to at first, and at least after the surface refused its drawings. */
-const BUDGET = 50_000
+const BUDGET = 80_000
 const MIN_BUDGET = 5_000
 /** Past this many changed files, or this size of one, a shell command's changes are not taken in. */
 const MAX_SHELL_FILES = 2000
 const MAX_SHELL_BYTES = 1_000_000
 /** How much text of files changed already is kept before a shell command. */
 const MAX_SHELL_TOTAL = 20_000_000
+/** How many paths a shell command names are looked at, before and after it. */
+const MAX_NAMED = 64
 /** What a read-only diff may take of a drawing, on a surface without an editor. */
 const MAX_PLAIN_DIFF = 60_000
 /** How many lines of code a review comment quotes to Claude. */
@@ -85,6 +97,7 @@ const COUNTERS = [
   'commentSeq',
   'edgeSeq',
   'revealSeq',
+  'expandSeq',
 ] as const satisfies readonly (keyof Counters)[]
 
 const countersOf = (from: Partial<Counters>): Counters =>
@@ -105,7 +118,10 @@ function isPost(data: unknown): data is EditorPost {
     (d.edge === 1 || d.edge === -1) &&
     Array.isArray(d.sel) &&
     d.sel.length === 2 &&
-    d.sel.every(n => typeof n === 'number')
+    d.sel.every(n => typeof n === 'number') &&
+    Array.isArray(d.cuts) &&
+    d.cuts.every(n => typeof n === 'number') &&
+    typeof d.expand === 'number'
   )
 }
 
@@ -152,9 +168,9 @@ function baseOf(f: TrackedFile, mode: BaseMode, turn: string): string {
 }
 
 /**
- * The part of `f` its editor holds when the whole file is too large to hand
- * over, undefined when it is not. Once a file goes by parts it stays so, to
- * keep its editor.
+ * What `f`'s editor holds when the whole file is too large to hand over: its
+ * hunks, or a part of the whole file; undefined when it is not too large.
+ * Once a file goes so it stays so, to keep its editor.
  */
 function windowOf(
   f: TrackedFile,
@@ -165,7 +181,7 @@ function windowOf(
 ): FileWindow | undefined {
   if (!kept && !isTooLarge(base, text, WINDOW_AT)) return undefined
 
-  return windowFor(base, text, f.rev, `${mode}:${fingerprint(base)}`, kept)
+  return windowFor(base, text, f.rev, `${mode}:${fingerprint(base)}`, f.isExpanded, kept)
 }
 
 /** The session's folder, read at session start: paths under it are shown relative. */
@@ -195,11 +211,14 @@ async function readText($: EngineInterface, path: string): Promise<string | unde
   }
 }
 
-async function statOf($: EngineInterface, path: string): Promise<{ mtimeMs: number; size: number } | undefined> {
+async function statOf(
+  $: EngineInterface,
+  path: string,
+): Promise<{ mtimeMs: number; size: number; kind: string } | undefined> {
   try {
     const s = await $.fs.stat(path)
 
-    return { mtimeMs: s.mtimeMs, size: s.size }
+    return { mtimeMs: s.mtimeMs, size: s.size, kind: s.kind }
   } catch {
     return undefined
   }
@@ -255,35 +274,98 @@ async function gitChanges($: EngineInterface, dir: string): Promise<Map<string, 
 /** A file's text, unless it is past MAX_SHELL_BYTES or binary: not worth a diff. */
 async function shellText($: EngineInterface, path: string): Promise<string | undefined> {
   const stat = await statOf($, path)
-  if (!stat || stat.size > MAX_SHELL_BYTES) return undefined
+  if (!stat || stat.kind !== 'file' || stat.size > MAX_SHELL_BYTES) return undefined
   const text = await readText($, path)
 
   return text === undefined || text.includes('\0') ? undefined : text
 }
 
 type ShellBefore = {
-  changes: Map<string, string>
+  /** What git called changed; undefined outside a repository, or when git could not be asked. */
+  changes?: Map<string, string>
   /** Files already changed before the command and not on the list: their text then. */
   texts: Map<string, string>
+  /** The files the command names, not on the list: their text then, or undefined when there was none. */
+  named: Map<string, string | undefined>
 }
 
-/** Before a shell command: what git calls changed, and the text of those files the list does not have. */
-async function shellBefore($: EngineInterface): Promise<ShellBefore | undefined> {
+/** `a/./b/../c` as `a/c`; `base` absolute. */
+function joinPath(base: string, rel: string): string {
+  const out: string[] = []
+  for (const part of `${base}/${rel}`.split('/')) {
+    if (part === '..') out.pop()
+    else if (part && part !== '.') out.push(part)
+  }
+
+  return `/${out.join('/')}`
+}
+
+/**
+ * The files a shell command names, by absolute path: the words that look like
+ * paths, from the working folder and from each folder the command goes to,
+ * with `~` and the variables the command sets itself filled in. A file git
+ * ignores, or one outside the repository, shows only this way.
+ */
+async function namedPaths($: EngineInterface, command: string): Promise<string[]> {
+  const home = await $.env.get('HOME').catch(() => undefined)
+  const vars = new Map<string, string>()
+  for (const [, name, , value] of command.matchAll(/(?:^|[\s;&|(])([A-Za-z_]\w*)=(["']?)([^\s"';&|()]+)\2/g)) {
+    vars.set(name!, value!)
+  }
+  const fill = (word: string) => word.replace(/\$\{?([A-Za-z_]\w*)\}?/g, (all, name: string) => vars.get(name) ?? all)
+  const absolute = (word: string) =>
+    word.startsWith('/')
+      ? joinPath('/', word)
+      : word.startsWith('~/') && home
+        ? joinPath(home, word.slice(2))
+        : undefined
+  const bases = [cwd]
+  for (const [, dir] of command.matchAll(/(?:^|[\s;&|(])cd\s+["']?([^\s"';&|()]+)/g)) {
+    const at = absolute(fill(dir!)) ?? joinPath(cwd, fill(dir!))
+    if (!bases.includes(at)) bases.push(at)
+  }
+  const out = new Set<string>()
+  for (const raw of command.match(/[\w@%+=:,./~${}-]+/g) ?? []) {
+    const word = fill(raw).replace(/[:,]+$/, '')
+    if (!/[./]/.test(word) || word.includes('$') || word.includes('://') || word.startsWith('-')) continue
+    if (word.length > 1024 || /^[.~/]+$/.test(word)) continue
+    const at = absolute(word)
+    for (const path of at ? [at] : word.startsWith('~') ? [] : bases.map(b => joinPath(b, word))) {
+      if (!path.includes('/.git/')) out.add(path)
+    }
+    if (out.size >= MAX_NAMED) break
+  }
+
+  return [...out].slice(0, MAX_NAMED)
+}
+
+/** Before a shell command: what git calls changed, and the text of those files and of the files it names. */
+async function shellBefore($: EngineInterface, command: string): Promise<ShellBefore> {
   if (!cwd) cwd = await $.session.cwd()
   const changes = await gitChanges($, cwd)
-  if (!changes) return undefined
   const listed = new Set((await read($, files)).map(f => f.path))
   const texts = new Map<string, string>()
   let bytes = 0
-  for (const path of changes.keys()) {
+  for (const path of changes?.keys() ?? []) {
     if (listed.has(path) || bytes > MAX_SHELL_TOTAL) continue
     const text = await shellText($, path)
     if (text === undefined) continue
     texts.set(path, text)
     bytes += text.length
   }
+  const named = new Map<string, string | undefined>()
+  for (const path of await namedPaths($, command).catch(() => [])) {
+    if (listed.has(path) || changes?.has(path)) continue
+    const stat = await statOf($, path)
+    // A folder, or a file too large or binary to show, is no file to follow.
+    if (stat && (stat.kind !== 'file' || stat.size > MAX_SHELL_BYTES)) continue
+    const text = stat ? await shellText($, path) : undefined
+    if (stat && (text === undefined || bytes > MAX_SHELL_TOTAL)) continue
+    named.set(path, text)
+    bytes += text?.length ?? 0
+  }
 
-  return { changes, texts }
+  return { changes, texts, named }
 }
 
 /**
@@ -292,18 +374,24 @@ async function shellBefore($: EngineInterface): Promise<ShellBefore | undefined>
  * is compared with its text before the command.
  */
 async function shellAfter($: EngineInterface, before: ShellBefore): Promise<void> {
-  const changes = await gitChanges($, cwd)
-  if (!changes) return
-  const listed = new Set((await read($, files)).map(f => f.path))
-  for (const [path, status] of changes) {
+  const changes = before.changes && (await gitChanges($, cwd))
+  for (const [path, status] of changes ?? []) {
+    const listed = new Set((await read($, files)).map(f => f.path))
     if (listed.has(path) || status.includes('D')) continue
-    const was = before.changes.get(path)
+    const was = before.changes!.get(path)
     if (was !== undefined && !before.texts.has(path)) continue
     const after = await shellText($, path)
     if (after === undefined) continue
     const base = was !== undefined ? before.texts.get(path)! : status === '??' ? '' : await headOf($, path)
     if (base === null || base === after) continue
     await record($, path, base, after, was === undefined && base === '')
+  }
+  // The files it names, git or no git: a file it made is new, one it changed is compared with its text before.
+  for (const [path, was] of before.named) {
+    if ((await read($, files)).some(f => f.path === path)) continue
+    const after = await shellText($, path)
+    if (after === undefined || after === was) continue
+    await record($, path, was ?? '', after, was === undefined)
   }
 }
 
@@ -879,10 +967,10 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Write' }, ($, e, next) => tracked($, e.file_path, () => next(e)))
   on('tool.call', { tool: 'NotebookEdit' }, ($, e, next) => tracked($, e.notebook_path, () => next(e)))
 
-  // A shell command's changes, as git sees them; one in the background finishes too late to tell.
+  // A shell command's changes, as git sees them and in the files it names; one in the background finishes too late to tell.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (e.run_in_background) return next(e)
-    const before = await shellBefore($).catch(() => undefined)
+    const before = await shellBefore($, e.command).catch(() => undefined)
     const ran = await next(e)
     if (before) await shellAfter($, before).catch(() => {})
 
@@ -939,7 +1027,7 @@ export const register: Register = on => {
 
     if (post.focusSeq > last.focusSeq) await update($, active, () => post.path)
     const draft = (await read($, drafts))[post.path]
-    // A file by parts: the editor's text goes back in place of its part.
+    // A file by pieces or parts: the editor's text goes back in their place.
     let text: string | undefined = post.text
     let isDirty = post.isDirty
     const mode = await read($, baseMode)
@@ -950,11 +1038,17 @@ export const register: Register = on => {
     if (w) {
       text = undefined
       if (e.element === windowKey(file.id, w)) {
-        const back = spliceBack(before, w, post.text)
+        const back = spliceBack(before, w, post.text, post.cuts)
         text = back.text
         isDirty = text !== file.disk
-        if (w !== kept || back.lines !== w.lines) {
-          await update($, windows, ws => ({ ...ws, [post.path]: { ...w, lines: back.lines } }))
+        let now = back.window
+        if (post.expandSeq > last.expandSeq) {
+          const wider = expandGap(base, text, now, post.expand, WINDOW_AT)
+          if (wider) now = wider
+          else $.ui.toast(`${file.display}: no room to show more lines here; open it in your editor`)
+        }
+        if (w !== kept || JSON.stringify(now.pieces) !== JSON.stringify(w.pieces)) {
+          await update($, windows, ws => ({ ...ws, [post.path]: now }))
         }
       }
     }
@@ -1239,16 +1333,19 @@ export const register: Register = on => {
       const w = partOf(f)
       const { text, base } = w ? slices(wholeBase, whole, w) : { text: whole, base: wholeBase }
       const key = w ? windowKey(f.id, w) : `file-${f.id}`
+      const basePieces = w ? w.pieces.map(p => `${p.baseLine}+${p.baseLines}`).join(',') : ''
       const props = {
         file: f.path,
         text,
         patch: makePatch(base, text),
         rev: f.rev,
-        baseKey: `${mode}:${fingerprint(wholeBase)}${w ? `:${w.baseLine}:${w.baseLines}` : ''}`,
-        // By parts, whether the file has unsaved edits is told by the whole text.
+        baseKey: `${mode}:${fingerprint(wholeBase)}${w ? `:${basePieces}` : ''}`,
+        // By pieces, whether the file has unsaved edits is told by the whole text.
         diskHash: w ? '' : fingerprint(f.disk),
-        firstLine: w?.line ?? 0,
-        firstBaseLine: w?.baseLine ?? 0,
+        firstLine: w?.pieces[0]!.line ?? 0,
+        firstBaseLine: w?.pieces[0]!.baseLine ?? 0,
+        ...(w ? gapsOf(wholeBase, w) : { gaps: [], lead: 0, trail: 0 }),
+        isPieces: w !== undefined && !w.isWhole,
         conflict: f.conflict,
         expanded: f.isExpanded,
         isSplit: split,
@@ -1374,16 +1471,18 @@ export const register: Register = on => {
               />
             </Box>
           ) : null}
-          {part ? (
+          {/* Hunks all in the editor need no parts; only too many of them, or the whole file, do. */}
+          {part && (part.before || part.after) ? (
             <Box flexDirection="row" alignItems="center" gap={1}>
               <Text dimColor tabular>
-                Lines {part.line + 1}–{part.line + part.lines} of {splitLines(textOf(f)).length}
+                Lines {part.pieces[0]!.line + 1}–
+                {part.pieces[part.pieces.length - 1]!.line + part.pieces[part.pieces.length - 1]!.lines} of{' '}
+                {splitLines(textOf(f)).length}
               </Text>
-              {part.line > 0 || part.baseLine > 0 ? (
+              {part.before ? (
                 <Button key={`earlier-${f.id}`} label="↑ Earlier part" variant="secondary" onPress={movePart(f, -1)} />
               ) : null}
-              {part.line + part.lines < splitLines(textOf(f)).length ||
-              part.baseLine + part.baseLines < splitLines(base).length ? (
+              {part.after ? (
                 <Button key={`later-${f.id}`} label="↓ Later part" variant="secondary" onPress={movePart(f, 1)} />
               ) : null}
             </Box>

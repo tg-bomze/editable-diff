@@ -5,17 +5,20 @@
 //
 // Everything is drawn in the monospaced face, so a cell of the region is one
 // column of text and the pointer lands where it is drawn. Long lines wrap to
-// the region's width. A large diff is shown through a window of WINDOW changed
-// rows, with the unchanged rows around them, that moves by STEP changed rows.
+// the region's width. Every hunk is drawn, as GitHub draws them; only a diff
+// past what one drawing may hold is cut after a whole change block, and
+// scrolls down and up by half a drawing. A file too large to hand over whole comes as its
+// hunks, pieces of it end to end: the stretches between them are drawn as left
+// out, and a click on one asks the hooks module for its lines.
 
 import type { ClientKeyEvent, ClientModule, ClientPointerEvent, ClientSurface, Color } from 'claude-code'
 
 import type { EditorCommand, EditorPost } from '../types'
 import {
   applyPatch,
-  CONTEXT,
   changeBlocks,
   countChanges,
+  hunksOf,
   diffLines,
   fingerprint,
   isHiddenChar,
@@ -65,6 +68,13 @@ export type EditorProps = {
   firstLine: number
   /** Where the base `patch` gives starts in the base. */
   firstBaseLine: number
+  /** By pieces: the stretches left out between them, as [base line index here they fall before, lines]. */
+  gaps: [number, number][]
+  /** Lines left out before the first piece and after the last that a click may bring in. */
+  lead: number
+  trail: number
+  /** The text is the file's hunks, pieces end to end: every row of it is shown. */
+  isPieces: boolean
 }
 
 type Pos = { row: number; col: number }
@@ -75,8 +85,9 @@ type Seg = { k: number; from: number; to: number; first: boolean; last: boolean 
 /** One row of the region. A line's `seg` is the side that is edited; `left` the old side when split. */
 type Item =
   | { kind: 'line'; v: number; seg?: Seg; left?: Seg; block?: [number, number] }
-  | { kind: 'gap'; from: number; to: number; header: string }
-  /** `count` changed rows before or after the window, among `lines` rows in all. */
+  /** Rows [from, to) hidden; with `far`, also `hidden` lines left out of the text, asked for by a click. */
+  | { kind: 'gap'; from: number; to: number; header: string; far?: number; hidden?: number }
+  /** `count` hunks before the drawing or after where the budget stopped it, among `lines` units in all. */
   | { kind: 'prev' | 'next'; count: number; lines: number }
 
 /** What the window moves over: a diff row, or an old and a new row side by side. */
@@ -112,6 +123,13 @@ type Model = {
     states: LineState[]
     blocks: [number, number][]
     blockEnd: Map<number, number>
+    /** The file's 0-based line of each line here, and of each base line. */
+    newAt: Int32Array
+    oldAt: Int32Array
+    /** Rows that start after a stretch left out, to the stretch's number (k, before piece k). */
+    far: Map<number, number>
+    /** Where each stretch between pieces falls in the text, as a line index. */
+    cuts: number[]
   }
   /** Base line numbers of unchanged lines the person opened. */
   opened: Set<number>
@@ -121,8 +139,12 @@ type Model = {
   stop: number
   /** How many units there are in all, for the window's last one. */
   shown: number
-  /** How many of the units before each one are changed rows: `chg[k + 1] > chg[k]` when unit k is one. */
-  chg: Int32Array
+  /** The unit each hunk starts at. */
+  hs: number[]
+  /** The unit at half of what the last drawing serialized to: where moving on starts the next one. */
+  midAt: number
+  /** The units of the last layout, which `win`, `stop` and `hs` count in. */
+  units: Unit[]
   /** Keep the cursor inside the window (after keys); off once the person moves the window. */
   isFollowing: boolean
   undo: Snap[]
@@ -134,6 +156,9 @@ type Model = {
   commentSeq: number
   edgeSeq: number
   revealSeq: number
+  expandSeq: number
+  /** The stretch left out the last click asked for. */
+  expand: number
   edge: 1 | -1
   cmdSeq: number
   clip: string
@@ -162,9 +187,13 @@ type State = { m: Model }
 
 const TAB = 4
 const UNDO = 300
-const WINDOW = 100
-const STEP = 50
-const BUDGET = 50_000
+const BUDGET = 80_000
+/**
+ * How far past the budget a change block may take the drawing so as not to
+ * be cut in two: within the tree's bounds (100,000 characters serialized), and
+ * shrinking with the budget when a surface cannot draw that much.
+ */
+const BLOCK_ROOM = 1.15
 const MAX_MATCHES = 5000
 /** The narrowest text column a split side may have. */
 const MIN_SPLIT = 24
@@ -359,10 +388,47 @@ function diffOf(m: Model): NonNullable<Model['diff']> {
       states: lineStates(m.lines, m.props.language ?? undefined),
       blocks,
       blockEnd: new Map(blocks),
+      ...placesOf(m, rows),
     }
   }
 
   return m.diff
+}
+
+/**
+ * Where the lines here are in the file: past each stretch left out between
+ * pieces, the lines after it are that many further on. A stretch falls before
+ * the first row of the base line it was left out before.
+ */
+function placesOf(
+  m: Model,
+  rows: readonly Row[],
+): Pick<NonNullable<Model['diff']>, 'newAt' | 'oldAt' | 'far' | 'cuts'> {
+  const { gaps, firstLine, firstBaseLine } = m.props
+  const newAt = new Int32Array(m.lines.length)
+  const oldAt = new Int32Array(m.base.length)
+  const far = new Map<number, number>()
+  const cuts: number[] = []
+  let off = 0
+  let n = 0
+  let texts = 0
+  rows.forEach((row, k) => {
+    if (row.oldNo > 0) {
+      while (n < gaps.length && gaps[n]![0] <= row.oldNo - 1) {
+        off += gaps[n]![1]
+        far.set(k, ++n)
+        cuts.push(texts)
+      }
+      oldAt[row.oldNo - 1] = row.oldNo - 1 + firstBaseLine + off
+    }
+    if (row.newNo > 0) {
+      newAt[row.newNo - 1] = row.newNo - 1 + firstLine + off
+      texts++
+    }
+  })
+  while (cuts.length < gaps.length) cuts.push(texts)
+
+  return { newAt, oldAt, far, cuts }
 }
 
 function selection(m: Model): [Pos, Pos] | null {
@@ -374,11 +440,12 @@ function selection(m: Model): [Pos, Pos] | null {
 /** The lines the selection covers, or the cursor's line: 1-based, inclusive. */
 function selectedLines(m: Model): [number, number] {
   const sel = selection(m)
-  const at = m.props.firstLine + 1
-  if (!sel) return [m.cur.row + at, m.cur.row + at]
+  const { newAt } = diffOf(m)
+  const at = (row: number) => newAt[row]! + 1
+  if (!sel) return [at(m.cur.row), at(m.cur.row)]
   const last = sel[1].col === 0 && sel[1].row > sel[0].row ? sel[1].row - 1 : sel[1].row
 
-  return [sel[0].row + at, last + at]
+  return [at(sel[0].row), at(last)]
 }
 
 function textBetween(m: Model, a: Pos, b: Pos): string {
@@ -454,10 +521,13 @@ function post(m: Model): void {
     commentSeq: m.commentSeq,
     edgeSeq: m.edgeSeq,
     revealSeq: m.revealSeq,
+    expandSeq: m.expandSeq,
     clip: m.clip,
     sel,
     edge: m.edge,
     cmdSeq: m.cmdSeq,
+    cuts: diffOf(m).cuts,
+    expand: m.expand,
   }
   m.surface.post(data)
 }
@@ -477,7 +547,8 @@ function hunkHeader(m: Model, rows: readonly Row[], shown: Uint8Array, start: nu
   let newStart = 0
   let oldCount = 0
   let newCount = 0
-  for (let k = start; k < rows.length && shown[k]; k++) {
+  const { far, newAt, oldAt } = diffOf(m)
+  for (let k = start; k < rows.length && shown[k] && (k === start || !far.has(k)); k++) {
     const row = rows[k]!
     if (row.oldNo > 0) {
       if (!oldStart) oldStart = row.oldNo
@@ -489,8 +560,8 @@ function hunkHeader(m: Model, rows: readonly Row[], shown: Uint8Array, start: nu
     }
   }
 
-  const old = oldStart ? oldStart + m.props.firstBaseLine : 0
-  const now = newStart ? newStart + m.props.firstLine : 0
+  const old = oldStart ? oldAt[oldStart - 1]! + 1 : 0
+  const now = newStart ? newAt[newStart - 1]! + 1 : 0
 
   return `@@ -${old},${oldCount} +${now},${newCount} @@`
 }
@@ -523,7 +594,7 @@ const hiOf = (u: Unit) => Math.max(u.l ?? -1, u.r ?? -1)
 
 /** Lays out the region's rows: the window over the units shown, wrapped, with hunk headers between. */
 function layout(m: Model): void {
-  const { rows, blockEnd } = diffOf(m)
+  const { rows, blockEnd, far, newAt, oldAt } = diffOf(m)
   const pinned = new Set<number>()
   let cursorK = -1
   rows.forEach((row, k) => {
@@ -531,9 +602,9 @@ function layout(m: Model): void {
     if (row.kind === 'ctx' && m.opened.has(row.oldNo)) pinned.add(k)
   })
   if (m.isActive && cursorK >= 0) pinned.add(cursorK)
-  const visible = m.props.expanded ? rows.map((_, k) => k) : visibleRows(rows, pinned)
+  const visible = m.props.expanded || m.props.isPieces ? rows.map((_, k) => k) : visibleRows(rows, pinned)
 
-  m.numW = String(Math.max(1, m.lines.length + m.props.firstLine, m.base.length + m.props.firstBaseLine)).length
+  m.numW = String(Math.max(1, newAt[m.lines.length - 1] ?? 0, oldAt[m.base.length - 1] ?? 0) + 1).length
   const columns = m.surface.columns
   const side = m.numW + 1
   const half = Math.floor((columns - 2 * side) / 2)
@@ -550,17 +621,35 @@ function layout(m: Model): void {
     width = columns > m.textX + 8 ? columns - m.textX : Infinity
   }
   const units: Unit[] = m.isSplitDrawn ? pairUp(rows, visible) : visible.map(k => ({ r: k }))
+  // The window keeps to its rows when the units shift: a line opened or the cursor's line pinned before it.
+  if (m.units.length > 0) {
+    const rowOf = (u: number) => (u < m.units.length ? loOf(m.units[u]!) : Infinity)
+    const unitAt = (row: number) => {
+      const k = units.findIndex(u => loOf(u) >= row)
+      return k < 0 ? units.length : k
+    }
+    ;[m.win, m.stop] = [unitAt(rowOf(m.win)), unitAt(rowOf(m.stop))]
+  }
+  m.units = units
 
-  const isChanged = (k: number | undefined) => k !== undefined && rows[k]!.kind !== 'ctx'
-  m.chg = new Int32Array(units.length + 1)
-  units.forEach((u, k) => (m.chg[k + 1] = m.chg[k]! + (isChanged(u.l) || isChanged(u.r) ? 1 : 0)))
+  // Hunks, by the unit each starts at: how many lie above and below a drawing too large to draw at once.
+  m.hs = []
+  let u0 = 0
+  for (const [from] of hunksOf(rows, [...far.keys()])) {
+    while (u0 < units.length && hiOf(units[u0]!) < from) u0++
+    if (u0 < units.length && m.hs[m.hs.length - 1] !== u0) m.hs.push(u0)
+  }
 
   if (m.isFollowing && cursorK >= 0) {
     const at = units.findIndex(u => u.r === cursorK)
-    if (at >= 0 && (at < m.win || at >= m.stop)) m.win = Math.max(0, at - 10)
+    if (at >= 0 && (at < m.win || at >= m.stop)) {
+      // From the start of the cursor's hunk, unless that is too far back to draw down to it.
+      const start = m.hs[hunkAt(m.hs, at)]
+      m.win = start !== undefined && at - start < 40 ? start : Math.max(0, at - 10)
+    }
   }
-  // Past the end (the diff got shorter), the window goes back to its last WINDOW changed rows.
-  if (m.win >= units.length) m.win = back(m.chg, units.length, WINDOW)
+  // Past the end (the diff got shorter), the drawing goes back to its last hunk.
+  if (m.win >= units.length) m.win = m.hs[m.hs.length - 1] ?? 0
   m.win = Math.max(0, m.win)
 
   const segsOf = (k: number | undefined, w: number, firstW: number): Seg[] => {
@@ -580,16 +669,22 @@ function layout(m: Model): void {
   const shown = new Uint8Array(rows.length)
   for (const k of visible) shown[k] = 1
   const items: Item[] = []
-  if (m.win > 0) items.push({ kind: 'prev', count: m.chg[m.win]!, lines: m.win })
+  const { gaps, lead, trail } = m.props
+  const hiddenOf = (k: number | undefined) =>
+    k === undefined ? undefined : k === 0 ? lead : k > gaps.length ? trail : gaps[k - 1]![1]
+  if (m.win > 0) items.push({ kind: 'prev', count: m.hs.filter(u => u < m.win).length, lines: m.win })
   let last = m.win > 0 ? hiOf(units[m.win - 1]!) : -1
   let end = m.win
-  // WINDOW changed rows, then up to CONTEXT unchanged ones after the last.
-  for (let tail = 0; end < units.length; end++) {
-    const isChange = m.chg[end + 1]! > m.chg[end]!
-    if (m.chg[end]! - m.chg[m.win]! >= WINDOW && (isChange || tail++ >= CONTEXT)) break
+  for (; end < units.length; end++) {
     const u = units[end]!
     const lo = loOf(u)
-    if (lo > last + 1) items.push({ kind: 'gap', from: last + 1, to: lo, header: hunkHeader(m, rows, shown, lo) })
+    // A stretch left out of the text lies before this row: before the first piece, or between two.
+    let farK: number | undefined = end === 0 && lead > 0 ? 0 : undefined
+    if (far.size > 0) for (let r = last + 1; r <= lo; r++) farK = far.get(r) ?? farK
+    if (lo > last + 1 || farK !== undefined) {
+      const header = hunkHeader(m, rows, shown, lo)
+      items.push({ kind: 'gap', from: last + 1, to: lo, header, far: farK, hidden: hiddenOf(farK) })
+    }
     const blockTo = blockEnd.get(lo)
     const block: [number, number] | undefined = blockTo === undefined ? undefined : [lo, blockTo]
     // A change's first row keeps room at its right end for the Revert label.
@@ -600,42 +695,46 @@ function layout(m: Model): void {
     }
     last = Math.max(last, hiOf(u))
   }
-  if (end < units.length) {
-    items.push({ kind: 'next', count: m.chg[units.length]! - m.chg[end]!, lines: units.length - end })
-  } else if (last >= 0 && last < rows.length - 1)
-    items.push({ kind: 'gap', from: last + 1, to: rows.length, header: '' })
+  if ((last >= 0 && last < rows.length - 1) || (trail > 0 && units.length > 0)) {
+    const farK = trail > 0 ? gaps.length + 1 : undefined
+    items.push({ kind: 'gap', from: last + 1, to: rows.length, header: '', far: farK, hidden: hiddenOf(farK) })
+  }
   if (visible.length === 0 && rows.length > 0) items.push({ kind: 'gap', from: 0, to: rows.length, header: '' })
   m.items = items
   m.shown = units.length
   m.stop = end
 }
 
-/** The unit `count` changed rows before `from`, with up to CONTEXT unchanged rows before it. */
-function back(chg: Int32Array, from: number, count: number): number {
-  const isChange = (k: number) => chg[k + 1]! > chg[k]!
-  let k = from
-  for (let n = 0; k > 0 && n < count; ) if (isChange(--k)) n++
-  for (let d = 0; d < CONTEXT && k > 0 && !isChange(k - 1); d++) k--
+/** The last hunk that starts at or before unit `u`, -1 before the first. */
+function hunkAt(hs: readonly number[], u: number): number {
+  let h = -1
+  while (h + 1 < hs.length && hs[h + 1]! <= u) h++
 
-  return k
+  return h
+}
+
+/** Whether unit `v` shows a changed row. */
+function isChangeUnit(m: Model, rows: readonly Row[], v: number): boolean {
+  const u = m.units[v]
+
+  return u !== undefined && [u.l, u.r].some(k => k !== undefined && rows[k]!.kind !== 'ctx')
 }
 
 /**
- * Where "Show next" (`dir` 1) and "Show previous" move the window: STEP
- * changed rows on or back, with up to CONTEXT unchanged rows before its first
- * change; on, never past the first unit the last drawing left out, so none is skipped.
+ * Where "Scroll down" (`dir` 1) and "Scroll up" move a drawing too large to
+ * draw at once: by half of it, so half of what was drawn stays in sight. On,
+ * from the unit at half its size, never past the first unit it left out; back,
+ * by half its units. A start inside a change block goes back to the block's.
  */
 function moveWindow(m: Model, dir: 1 | -1): number {
-  const { chg, win } = m
-  if (dir < 0) return back(chg, win, STEP)
-  const isChange = (k: number) => chg[k + 1]! > chg[k]!
-  let at = win
-  while (at < chg.length - 1 && !(isChange(at) && chg[at]! - chg[win]! === STEP)) at++
-  if (at < m.stop) {
-    for (let d = 0; d < CONTEXT && at - 1 > win && !isChange(at - 1); d++) at--
-  } else at = m.stop
+  const { rows } = diffOf(m)
+  const { win, stop } = m
+  let to = dir > 0 ? Math.min(Math.max(win + 1, m.midAt), stop) : Math.max(0, win - Math.ceil((stop - win) / 2))
+  let at = to
+  while (at > 0 && isChangeUnit(m, rows, at) && isChangeUnit(m, rows, at - 1)) at--
+  if (dir < 0 || at > win) to = at
 
-  return Math.max(win + 1, at)
+  return to
 }
 
 /** The item the cursor is on, and its cell column there. */
@@ -1096,6 +1195,12 @@ function onPointer(m: Model, ev: ClientPointerEvent): void {
   if (item?.kind === 'gap') {
     const { rows } = diffOf(m)
     for (let k = item.from; k < item.to; k++) if (rows[k]!.oldNo > 0) m.opened.add(rows[k]!.oldNo)
+    if (item.far !== undefined) {
+      // Lines left out of the text: the hooks module brings them in.
+      m.expand = item.far
+      m.expandSeq++
+      post(m)
+    }
     redraw(m)
     return
   }
@@ -1161,7 +1266,9 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
       win: 0,
       stop: Infinity,
       shown: 0,
-      chg: new Int32Array(1),
+      hs: [],
+      midAt: 0,
+      units: [],
       isFollowing: false,
       undo: [],
       redo: [],
@@ -1172,6 +1279,8 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
       commentSeq: 0,
       edgeSeq: 0,
       revealSeq: 0,
+      expandSeq: 0,
+      expand: 0,
       edge: 1,
       cmdSeq: 0,
       clip: '',
@@ -1232,8 +1341,8 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
   const matches = m.find ? matchesOf(m) : []
   const matchesOn = new Map<number, Match[]>()
   for (const x of matches) matchesOn.set(x.row, [...(matchesOn.get(x.row) ?? []), x])
-  const isNoted = (r: number) =>
-    props.notes.some(([a, b]) => r + 1 + props.firstLine >= a && r + 1 + props.firstLine <= b)
+  const { newAt, oldAt } = diffOf(m)
+  const isNoted = (r: number) => props.notes.some(([a, b]) => newAt[r]! + 1 >= a && newAt[r]! + 1 <= b)
 
   const inSelection = (row: number, col: number) => {
     if (!sel) return false
@@ -1313,22 +1422,30 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
             </Text>,
           ]
         : []),
-      <Text key="m" mono color={row.kind === 'add' ? 'success' : row.kind === 'del' ? 'error' : undefined}>
-        {`${note ? '' : ' '}${marker} `}
-      </Text>,
-      ...cells.map((c, j) => (
-        <Text key={`${j}`} mono color={c.style.color} backgroundColor={c.style.bg} inverse={c.style.inverse}>
-          {c.text}
+      row.kind === 'ctx' ? (
+        `${note ? '' : ' '}${marker} `
+      ) : (
+        <Text key="m" mono color={row.kind === 'add' ? 'success' : 'error'}>
+          {`${note ? '' : ' '}${marker} `}
         </Text>
-      )),
+      ),
+      // A run with no style of its own is the enclosing Text's: half the size drawn.
+      ...cells.map((c, j) =>
+        c.style.color || c.style.bg || c.style.inverse ? (
+          <Text key={`${j}`} mono color={c.style.color} backgroundColor={c.style.bg} inverse={c.style.inverse}>
+            {c.text}
+          </Text>
+        ) : (
+          c.text
+        ),
+      ),
     ]
   }
 
   const numberOf = (seg: Seg | undefined, side: 'oldNo' | 'newNo') => {
     const no = seg?.first ? rows[seg.k]![side] : 0
-    const first = side === 'oldNo' ? props.firstBaseLine : props.firstLine
 
-    return pad(no > 0 ? String(no + first) : '', numW)
+    return pad(no > 0 ? String((side === 'oldNo' ? oldAt : newAt)[no - 1]! + 1) : '', numW)
   }
 
   const drawLine = (item: Extract<Item, { kind: 'line' }>, n: number) => {
@@ -1377,19 +1494,33 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
     )
   }
 
+  // "↺ Revert" at the right end of each change's first row.
+  const revertOf = (n: number) => (
+    <Box
+      key={`rv${n}`}
+      position="absolute"
+      top={n + m!.top}
+      left={m!.surface.columns - REVERT.length}
+      width={REVERT.length}
+    >
+      <Text mono color={hunkText} backgroundColor={palette.hunk}>
+        {REVERT}
+      </Text>
+    </Box>
+  )
+
   const { added, removed } = countChanges(rows)
   const drawItem = (item: Item, n: number) => {
     if (item.kind === 'line') return drawLine(item, n)
     if (item.kind !== 'gap') {
-      // Counted in changed rows; in unchanged ones where only those are left (the whole file shown).
+      // Counted in hunks; in lines where only unchanged ones are left (the whole file shown).
+      const blocks = (n: number) => `${n} ${n === 1 ? 'block' : 'blocks'}`
       const label =
         item.kind === 'prev'
-          ? item.count > 0
-            ? `↑  Show previous ${Math.min(STEP, item.count)} changed lines`
-            : `↑  Show previous lines`
+          ? `↑  Scroll up${item.count > 0 ? `  ·  ${blocks(item.count)} above` : ''}`
           : item.count > 0
-            ? `↓  Show next ${Math.min(STEP, item.count)} changed lines  (${item.count} more)`
-            : `↓  Show the last ${item.lines} lines`
+            ? `↓  Scroll down  ·  ${blocks(item.count)} below`
+            : `↓  Scroll down  ·  ${item.lines} more ${item.lines === 1 ? 'line' : 'lines'}`
 
       return (
         <Box key={`w${n}`} flexDirection="row" width="100%" backgroundColor={palette.hunk}>
@@ -1400,7 +1531,7 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
         </Box>
       )
     }
-    const count = item.to - item.from
+    const count = item.to - item.from + (item.hidden ?? 0)
     const label =
       added + removed === 0 && item.from === 0 && item.to === rows.length
         ? `No changes from the base · show file (${count} lines)`
@@ -1429,26 +1560,51 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
     )
   }
 
-  // Draw rows until they would serialize past the budget; the rest of the window waits behind "Show next".
+  // Every hunk is drawn while the rows serialize within the budget; past it the rest waits behind "Scroll down".
   const budget = props.budget > 0 ? props.budget : BUDGET
-  let drawn = m.items.map(drawItem)
-  let size = 0
-  const over = drawn.findIndex((el, n) => (size += JSON.stringify(el).length) > budget && m!.items[n]!.kind === 'line')
+  const room = budget * BLOCK_ROOM
+  let drawn: ReturnType<typeof drawItem>[] = []
+  const upTo: number[] = []
+  // Each change's Revert label is drawn beside its rows, and counts with them.
+  const revertSize = JSON.stringify(revertOf(0)).length
+  for (let n = 0, sum = 0; n < m.items.length && sum <= room; n++) {
+    const item = m.items[n]!
+    drawn.push(drawItem(item, n))
+    sum += JSON.stringify(drawn[n]).length + (item.kind === 'line' && item.block ? revertSize : 0)
+    upTo.push(sum)
+  }
+  const pastAt = (max: number) => upTo.findIndex((size, n) => size > max && m!.items[n]!.kind === 'line')
+  const over = drawn.length < m.items.length ? Math.max(pastAt(budget), 0) : pastAt(budget)
   if (over >= 0) {
     const lineAt = (item: Item | undefined) => (item?.kind === 'line' ? item.v : -1)
     const firstV = lineAt(m.items.find(item => item.kind === 'line'))
+    const cutAt = (v: number) => {
+      const cut = m!.items.findIndex(item => lineAt(item) >= v)
+      return cut < 0 ? m!.items.length : m!.items[cut - 1]?.kind === 'gap' ? cut - 1 : cut
+    }
+    const isChange = (v: number) => isChangeUnit(m!, rows, v)
     // The first unit not drawn; the window's first unit is always drawn, or it could never move on.
-    const stopV = Math.max(lineAt(m.items[over]), firstV + 1)
-    let cut = m.items.findIndex(item => lineAt(item) >= stopV)
-    if (cut < 0) cut = m.items.length
-    else if (m.items[cut - 1]?.kind === 'gap') cut--
-    const next: Item = { kind: 'next', count: m.chg[m.shown]! - m.chg[stopV]!, lines: m.shown - stopV }
-    m.items = [...m.items.slice(0, cut), ...(next.lines > 0 ? [next] : [])]
-    m.stop = stopV
-    caret = null
-    here = -1
-    drawn = m.items.map(drawItem)
+    let stopV = Math.max(lineAt(m.items[over]), firstV + 1)
+    // A change block is not cut in two: the drawing goes on to its end, unless it is too long to draw at all.
+    while (stopV < m.stop && isChange(stopV) && isChange(stopV - 1)) stopV++
+    if ((upTo[cutAt(stopV) - 1] ?? Infinity) > room) stopV = Math.max(lineAt(m.items[pastAt(room)]), firstV + 1)
+    if (stopV < m.stop) {
+      const next: Item = {
+        kind: 'next',
+        count: m.hs.filter(u => u >= stopV).length,
+        lines: m.shown - stopV,
+      }
+      m.items = [...m.items.slice(0, cutAt(stopV)), ...(next.lines > 0 ? [next] : [])]
+      m.stop = stopV
+      caret = null
+      here = -1
+      drawn = m.items.map(drawItem)
+    }
   }
+  // Half of what is drawn, where scrolling down starts the next drawing.
+  const total = upTo[Math.min(upTo.length, m.items.length) - 1] ?? 0
+  const mid = m.items.find((item, n) => item.kind === 'line' && upTo[n]! > total / 2)
+  m.midAt = mid?.kind === 'line' ? mid.v : m.stop
   const bar = caret as { top: number; left: number } | null
 
   // The find bar: fields and labels laid out cell by cell, so a click finds what it hit.
@@ -1502,26 +1658,9 @@ const Editor: ClientModule<EditorProps, State> = (props, surface) => {
     )
   }
 
-  // "↺ Revert" at the right end of each change's first row.
   const reverts =
     m.surface.columns - REVERT.length > m.textX
-      ? m.items.flatMap((item, n) =>
-          item.kind === 'line' && item.block
-            ? [
-                <Box
-                  key={`rv${n}`}
-                  position="absolute"
-                  top={n + m!.top}
-                  left={m!.surface.columns - REVERT.length}
-                  width={REVERT.length}
-                >
-                  <Text mono color={hunkText} backgroundColor={palette.hunk}>
-                    {REVERT}
-                  </Text>
-                </Box>,
-              ]
-            : [],
-        )
+      ? m.items.flatMap((item, n) => (item.kind === 'line' && item.block ? [revertOf(n)] : []))
       : []
 
   return (

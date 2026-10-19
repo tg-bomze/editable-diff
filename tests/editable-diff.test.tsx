@@ -2,10 +2,10 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, FoundElement } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import type { SavedSession } from '../types'
+import type { FileWindow, SavedSession } from '../types'
 import { fingerprint } from '../hooks/diff'
 import { tokenize } from '../hooks/highlight'
-import { shiftWindow, slices, spliceBack, windowFor } from '../hooks/window'
+import { gapsOf, slices, spliceBack, windowAtChange, windowFor } from '../hooks/window'
 
 const FILE = '/proj/src/a.ts'
 const PANE = {
@@ -232,40 +232,25 @@ test('Clear asks first when there are unsaved edits, and never touches the disk'
   await ui.unmount()
 })
 
-test('a large diff shows 100 rows at a time and the window moves by 50', async ($, on) => {
-  world(on, { [FILE]: 'x\n' })
-  const many = Array.from({ length: 300 }, (_, i) => `L${i + 1}`).join('\n')
-  await claudeEdits($, 'x', many)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-
-  // Rows: -x, +L1 … +L300, then the trailing empty line; the first 100 are drawn.
-  expect(await line(ui, / L99$/)).toBeDefined()
-  expect(await line(ui, / L100$/)).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /Show next 50 changed lines/, in: 'file-1' })).toBeDefined()
-
-  await ui.pointer({ type: 'down', x: 10, y: 100, button: 'left', in: 'file-1' })
-  expect(await ui.find({ type: 'Text', text: /Show previous 50 changed lines/, in: 'file-1' })).toBeDefined()
-  expect(await line(ui, / L49$/)).toBeUndefined()
-  expect(await line(ui, / L50$/)).toBeDefined()
-  expect(await line(ui, / L149$/)).toBeDefined()
-  await ui.unmount()
-})
-
-test('the window counts changed lines: unchanged ones around them come along', async ($, on) => {
-  const old = Array.from({ length: 180 }, (_, i) => `l${i}`).join('\n')
+test('a diff shows every hunk at once, each with 3 unchanged lines on either side', async ($, on) => {
+  const old = Array.from({ length: 300 }, (_, i) => `L${i}`).join('\n')
   world(on, { [FILE]: `${old}\n` })
-  // 9 changes, each with 10 unchanged lines around it: 108 rows, 18 of them changed.
+  // 15 changes 20 lines apart: 15 hunks.
   await claudeEdits(
     $,
     old,
-    old.replace(/^l(\d*0)$/gm, (all, n: string) => (Number(n) % 20 === 10 ? `X${n}` : all)),
+    old.replace(/^L(\d*0)$/gm, (all, n: string) => (Number(n) % 20 === 10 ? `X${n}` : all)),
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
-  expect(await line(ui, / X10$/)).toBeDefined()
-  expect(await line(ui, / X170$/)).toBeDefined()
-  expect(await line(ui, / l175$/)).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })).toBeUndefined()
+  for (let n = 10; n < 300; n += 20) expect(await line(ui, new RegExp(` X${n}$`))).toBeDefined()
+  expect(await line(ui, / L7$/)).toBeDefined()
+  expect(await line(ui, / L6$/)).toBeUndefined()
+  expect(await line(ui, / L293$/)).toBeDefined()
+  expect(await line(ui, / L294$/)).toBeUndefined()
+  // Between two hunks, the 13 unchanged lines that open with a click.
+  expect(await ui.find({ type: 'Text', text: /13 unchanged lines/, in: 'file-1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Scroll (up|down)/, in: 'file-1' })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -351,7 +336,27 @@ test('the desktop cursor is drawn on the row and column clicked', async ($, on) 
   await ui.unmount()
 })
 
-test('long changed lines: the window stops short of the tree bounds, and Show next skips no line', async ($, on) => {
+test('a change block past the budget is drawn to its end, not cut in two', async ($, on) => {
+  const old = Array.from({ length: 1000 }, (_, i) => `line ${i}`).join('\n')
+  world(on, { [FILE]: `${old}\n` })
+  // 21 one-line changes, then a block of 12 lines replaced (24 rows), then one more change.
+  const now = old
+    .replace(/^line (\d*0)$/gm, (all, n: string) => (Number(n) % 20 === 10 && Number(n) < 420 ? `A${n}` : all))
+    .replace(/^line (\d+)$/gm, (all, n: string) => (Number(n) >= 440 && Number(n) < 452 ? `B${n}` : all))
+    .replace(/^line 600$/m, 'C600')
+  await claudeEdits($, old, now)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // The budget runs out inside the block: it is drawn whole all the same, and the rest waits.
+  expect(await line(ui, / A410$/)).toBeDefined()
+  expect(await line(ui, / line 451$/)).toBeDefined()
+  expect(await line(ui, / B451$/)).toBeDefined()
+  expect(await line(ui, / C600$/)).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Scroll down {2}· {2}1 block below$/, in: 'file-1' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('long changed lines: the drawing stops short of the tree bounds and scrolls by half of it', async ($, on) => {
   const line = (i: number) =>
     `    const value${i} = await someFunction(argumentNumberOne, argumentNumberTwo, "string literal ${i}") // c`
   const old = Array.from({ length: 200 }, (_, i) => line(i)).join('\n')
@@ -362,20 +367,28 @@ test('long changed lines: the window stops short of the tree bounds, and Show ne
 
   const shown = async () => (await lines(ui)).map(l => /(?:value|VALUE)(\d+) /.exec(l.text)?.[0]).filter(Boolean)
   const before = await shown()
-  expect(await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })).toBeDefined()
-  const last = before[before.length - 1]!
+  expect(await ui.find({ type: 'Text', text: /Scroll down/, in: 'file-1' })).toBeDefined()
+  const no = (shown: string | undefined) => Number(/\d+/.exec(shown ?? '')?.[0] ?? -1)
+  const last = no(before[before.length - 1])
+  expect(last).toBeGreaterThan(10)
 
   const nextRow =
     (await ui.findAll({ type: 'Box', in: 'file-1' })).filter(b => /^[lwg]\d+$/.test(b.key ?? '')).length - 1
-  expect(before.length).toBeGreaterThan(0)
   await ui.pointer({ type: 'down', x: 10, y: nextRow, button: 'left', in: 'file-1' })
   const after = await shown()
-  // The window moved on to the row right after the last one drawn: none skipped.
-  expect(after[0]).toBe(`value${Number(/\d+/.exec(last)![0]) + 1} `)
+  // Half of the drawing went up and out of sight; the other half stays, and as much again comes in below.
+  expect(Math.abs(no(after[0]) - last / 2)).toBeLessThanOrEqual(3)
+  expect(after.some(x => no(x) === last)).toBe(true)
+  expect(no(after[after.length - 1])).toBeGreaterThan(last)
+
+  // Scrolling up goes back by half again: to the top.
+  await ui.pointer({ type: 'down', x: 10, y: 0, button: 'left', in: 'file-1' })
+  expect(no((await shown())[0])).toBe(0)
+  expect(await ui.find({ type: 'Text', text: /Scroll up/, in: 'file-1' })).toBeUndefined()
   await ui.unmount()
 })
 
-test('long lines near the end: Show next reaches the last line', async ($, on) => {
+test('long lines near the end: scrolling down reaches the last line', async ($, on) => {
   const line = (i: number) =>
     `    const value${i} = await someFunction(argumentNumberOne, argumentNumberTwo, "string literal ${i}") // c`
   const old = Array.from({ length: 120 }, (_, i) => line(i)).join('\n')
@@ -384,12 +397,12 @@ test('long lines near the end: Show next reaches the last line', async ($, on) =
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.resize({ columns: 90, rows: 40, in: 'file-1' })
 
-  for (let n = 0; n < 20 && (await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })); n++) {
+  for (let n = 0; n < 20 && (await ui.find({ type: 'Text', text: /Scroll down/, in: 'file-1' })); n++) {
     const nextRow =
       (await ui.findAll({ type: 'Box', in: 'file-1' })).filter(b => /^[lwg]\d+$/.test(b.key ?? '')).length - 1
     await ui.pointer({ type: 'down', x: 10, y: nextRow, button: 'left', in: 'file-1' })
   }
-  expect(await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Scroll down/, in: 'file-1' })).toBeUndefined()
   expect((await lines(ui)).some(l => l.text.includes('VALUE119 '))).toBe(true)
   await ui.unmount()
 })
@@ -650,7 +663,7 @@ test('quoted lines cannot close the fence around them in the review message', as
 })
 
 /** git over the test's disk: `head` is what HEAD holds, by path under /proj. */
-function fakeGit(on: On, disk: Map<string, string>, head: Record<string, string>) {
+function fakeGit(on: On, disk: Map<string, string>, head: Record<string, string>, ignored: string[] = []) {
   on('process.run', ($, e) => {
     const out = (stdout: string, exitCode = 0) => ({
       value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
@@ -662,6 +675,7 @@ function fakeGit(on: On, disk: Map<string, string>, head: Record<string, string>
       const entries: string[] = []
       for (const [path, text] of disk) {
         const rel = path.slice('/proj/'.length)
+        if (!path.startsWith('/proj/') || ignored.includes(rel)) continue
         if (head[rel] === undefined) entries.push(`?? ${rel}`)
         else if (head[rel] !== text) entries.push(` M ${rel}`)
       }
@@ -703,6 +717,43 @@ test('a shell command’s changes show: against HEAD, as new, or against the tex
   expect(await line(ui, /d-head$/, 'file-2')).toBeUndefined()
   await ui.pointer({ type: 'down', x: 2, y: 2, button: 'left', in: 'files' })
   expect(await ui.find({ type: 'Text', text: /^new$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a shell command’s changes to the files it names show, ignored by git or outside the repository', async ($, on) => {
+  const IGNORED = '/proj/system.md'
+  const SCRATCH = '/tmp/s/copy.md'
+  const HOME = '/home/me/notes/a.md'
+  const { disk, touch } = world(on, { [IGNORED]: 'old line\n', [HOME]: 'h1\n' })
+  fakeGit(on, disk, {}, ['system.md'])
+  on('env.get', () => ({ value: '/home/me' }))
+  on('tool.call', { tool: 'Bash' }, () => {
+    touch(IGNORED, 'new line\n')
+    touch(SCRATCH, 'made\n')
+    touch(HOME, 'h2\n')
+    return { result: {} } as never
+  })
+  const command = [
+    `S=/tmp/s && .venv/bin/python - "$S/copy.md" <<'EOF'`,
+    'import pathlib',
+    's = pathlib.Path("system.md").read_text()',
+    'EOF',
+    "sed -i '' s/h1/h2/ ~/notes/a.md",
+  ].join('\n')
+  await $.tool.call({ tool: 'Bash', command })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  // By path: a.md, copy.md, system.md; their ids in the order the command names them.
+  for (const name of [/a\.md/, /system\.md/, /copy\.md/]) {
+    expect(await ui.find({ type: 'Text', text: name, in: 'files' })).toBeDefined()
+  }
+  await ui.pointer({ type: 'down', x: 2, y: 1, button: 'left', in: 'files' })
+  expect((await line(ui, /made$/, 'file-1'))?.bg).toBe('#2ea04326')
+  await ui.pointer({ type: 'down', x: 2, y: 2, button: 'left', in: 'files' })
+  expect((await line(ui, /old line$/, 'file-2'))?.bg).toBe('#f8514926')
+  expect((await line(ui, /new line$/, 'file-2'))?.bg).toBe('#2ea04326')
+  await ui.pointer({ type: 'down', x: 2, y: 0, button: 'left', in: 'files' })
+  expect((await line(ui, /h1$/, 'file-3'))?.bg).toBe('#f8514926')
   await ui.unmount()
 })
 
@@ -762,7 +813,7 @@ test('mobile: the files as buttons and a read-only diff', async ($, on) => {
   await ui.unmount()
 })
 
-test('a file too large for the editor goes to it a part at a time', async ($, on) => {
+test('a file too large for the editor gets its hunks from all over it, the stretches between brought in by a click', async ($, on) => {
   const big = Array.from({ length: 12000 }, (_, i) => `line ${i}`)
   const { disk } = world(on, { [FILE]: `${big.join('\n')}\n` })
   await claudeEdits($, 'line 10\n', 'line 10 changed\n')
@@ -771,48 +822,78 @@ test('a file too large for the editor goes to it a part at a time', async ($, on
   const editorKey = async () =>
     (await ui.findAll({ type: 'Client' })).map(c => c.key ?? '').find(k => k.startsWith('file-'))!
   const first = await editorKey()
-  expect(first).toMatch(/^file-1~0~/)
-  expect(await ui.find({ type: 'Text', text: /^Lines 1–\d+ of 12001$/ })).toBeDefined()
-  expect(await line(ui, /line 10 changed$/, first)).toBeDefined()
+  expect(first).toMatch(/^file-1~1~/)
+  // Both changes in one editor, numbered as in the whole file, with no parts to page through.
+  expect(await line(ui, /\b11\b.*line 10 changed$/, first)).toBeDefined()
+  expect(await line(ui, /\b11001\b.*line 11000 changed$/, first)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Lines / })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /10983 unchanged lines/, in: first })).toBeDefined()
 
-  // An edit in the part goes back in its place: Save writes the whole file.
+  // An edit in a piece goes back in its place: Save writes the whole file.
   await ui.key({ key: 'end', in: first })
   await ui.key({ key: 'X', in: first })
   await ui.press({ key: 'save-1' })
-  const saved = big.map((l, i) => (i === 0 ? 'line 0X' : i === 10 || i === 11000 ? `${l} changed` : l))
+  const saved = big.map((l, i) => (i === 7 ? 'line 7X' : i === 10 || i === 11000 ? `${l} changed` : l))
   expect(disk.get(FILE)).toBe(`${saved.join('\n')}\n`)
 
-  // Past the part's last change, F7 goes on to the part with the next one.
-  await ui.key({ key: 'f7', in: first })
-  await ui.key({ key: 'f7', in: first })
+  // A click on the stretch between: too long to bring in whole, 20 lines from each side.
+  const rows = (await ui.findAll({ type: 'Box', in: first })).filter(b => /^[lwg]\d+$/.test(b.key ?? ''))
+  const gapRow = rows.findIndex(b => /10983 unchanged/.test(b.text))
+  await ui.pointer({ type: 'down', x: 10, y: gapRow, button: 'left', in: first })
   const second = await editorKey()
   expect(second).not.toBe(first)
-  // Its lines are numbered as in the whole file.
-  expect(await line(ui, /\b11001\b.*line 11000 changed$/, second)).toBeDefined()
+  expect(await line(ui, / line 33$/, second)).toBeDefined()
+  expect(await line(ui, / line 34$/, second)).toBeUndefined()
+  expect(await line(ui, / line 10977$/, second)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /10943 unchanged lines/, in: second })).toBeDefined()
 
-  // ↑ Earlier part goes back toward the start of the file.
-  await ui.press({ key: 'earlier-1' })
-  expect(await editorKey()).not.toBe(second)
+  // Whole file goes by contiguous parts.
+  await ui.press({ key: 'expand-1' })
+  expect(await ui.find({ type: 'Text', text: /^Lines 1–\d+ of 12001$/ })).toBeDefined()
+  await ui.press({ key: 'later-1' })
+  expect(await ui.find({ type: 'Text', text: /^Lines [1-9]\d+–\d+ of 12001$/ })).toBeDefined()
   await ui.unmount()
 })
 
-test('a part of a file splices back in place, CRLF kept, and the parts cover the file', () => {
-  const text = 'a\r\nb\r\nc\r\nd\r\n'
-  const w = { line: 1, lines: 2, baseLine: 1, baseLines: 2 }
-  expect(slices(text, text, w).text).toBe('b\r\nc\r')
-  expect(spliceBack(text, w, 'B\r\nX\r\nc')).toEqual({ text: 'a\r\nB\r\nX\r\nc\r\nd\r\n', lines: 3 })
-  expect(spliceBack('a\nb\nc', { ...w, lines: 2 }, 'B\nC').text).toBe('a\nB\nC')
-
-  const big = Array.from({ length: 20000 }, (_, i) => `row ${i}`).join('\n')
-  let part = windowFor(big, big, 0, 'k')
-  expect(part.line).toBe(0)
-  const seen = new Set<number>()
-  for (let next: typeof part | undefined = part; next; next = shiftWindow(big, big, part, 1)) {
-    part = next
-    for (let n = part.line; n < part.line + part.lines; n++) seen.add(n)
+test('pieces splice back in place, CRLF kept, and hunk windows reach every change', () => {
+  const text = 'a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n'
+  const w: FileWindow = {
+    pieces: [
+      { line: 1, lines: 1, baseLine: 1, baseLines: 1 },
+      { line: 4, lines: 1, baseLine: 4, baseLines: 1 },
+    ],
+    isWhole: false,
+    before: false,
+    after: false,
+    seq: 1,
+    rev: 0,
+    baseKey: 'k',
   }
-  expect(seen.size).toBe(20000)
-  expect(shiftWindow(big, big, part, -1)!.line).toBeLessThan(part.line)
+  expect(slices(text, text, w).text).toBe('b\r\ne\r')
+  expect(gapsOf(text, w)).toEqual({ gaps: [[1, 2]], lead: 1, trail: 2 })
+  const back = spliceBack(text, w, 'B\r\nX\r\ne', [2])
+  expect(back.text).toBe('a\r\nB\r\nX\r\nc\r\nd\r\ne\r\nf\r\n')
+  expect(back.window.pieces.map(p => [p.line, p.lines])).toEqual([
+    [1, 2],
+    [5, 1],
+  ])
+
+  const base = Array.from({ length: 20000 }, (_, i) => `row ${i}`)
+  const changed = base.map((l, i) => (i % 50 === 25 ? `${l} changed` : l))
+  const [b, t] = [base.join('\n'), changed.join('\n')]
+  let part = windowFor(b, t, 0, 'k', false)
+  expect(part.after).toBe(true)
+  const seen = new Set<number>()
+  for (let next: FileWindow | undefined = part; next; next = windowAtChange(b, t, part, 1)) {
+    part = next
+    for (const p of part.pieces) {
+      // No piece starts or ends inside a change: its edges are unchanged lines.
+      expect([p.line % 50, (p.line + p.lines - 1) % 50]).not.toContain(25)
+      for (let n = p.line; n < p.line + p.lines; n++) if (n % 50 === 25) seen.add(n)
+    }
+  }
+  expect(seen.size).toBe(400)
+  expect(windowAtChange(b, t, part, -1)!.pieces[0]!.line).toBeLessThan(part.pieces[0]!.line)
 })
 
 test('the file list shows ten files and scrolls the rest: keys, wheel, scrollbar', async ($, on) => {

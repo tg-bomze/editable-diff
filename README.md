@@ -41,7 +41,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 
 ### The diff
 
-- **GitHub style.** Old and new line numbers, `@@` hunk headers, tinted removed and added lines, the changed words marked within a changed line, and 5 lines of context around each change.
+- **GitHub style.** Old and new line numbers, `@@` hunk headers, tinted removed and added lines, the changed words marked within a changed line, and 3 lines of context around each change.
 - **Syntax colours** for the language of the file, on the diff lines as on the context.
 - **Hidden lines on demand.** Click a hunk header to show the unchanged lines it stands for, or press **Whole file** to see all of the file; **Changes only** goes back.
 - **Unified or Split.** **Split** shows the old file on the left and the new one on the right, each change's removed lines beside its added ones. On a narrow panel it falls back to one column.
@@ -51,8 +51,8 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
   - **Last turn**: the file as Claude's last turn found it, so only what that turn did shows. A file the last turn did not touch says so.
   - **Git HEAD**: the file as committed. A file not yet committed compares with an empty one; outside a git repository the panel says so and uses the session start.
 - **Long lines wrap** to the width of the panel instead of running off its edge.
-- **Large diffs stay fast.** About 100 changed lines are drawn at a time, with the unchanged lines around them, fewer when the lines are long. **Show next 50 changed lines** / **Show previous 50 changed lines** move the window, and so does the cursor.
-- **Large files by parts.** A file too large to hand to the editor whole (about 90,000 characters with its diff) is edited a part at a time, around its first change: **Lines 1–2000 of 12000**, with **↑ Earlier part** / **↓ Later part**, and F7 moves on to the part with the next change. Line numbers are the file's, and Save writes the whole file.
+- **Every hunk at once.** All the changes show together, as on GitHub, each with 3 unchanged lines on either side; the stretches between them open with a click. Only a diff past what one drawing may hold (about 200 rows) stops after a whole change block, never inside one: **↓ Scroll down · N blocks below** and **↑ Scroll up** move it by half a drawing, so half of what was in sight stays; the cursor moves it too.
+- **Large files by hunks.** A file too large to hand to the editor whole (about 90,000 characters with its diff) goes to it as its hunks, from all over the file, with the unchanged stretches between them left out; a click on one brings it in, or 20 lines from each side when it is long. Line numbers are the file's, and Save writes the whole file. Only when the hunks themselves are too many does the editor take them a part at a time, **↑ Earlier part** / **↓ Later part**, as it does the whole file under **Whole file**.
 - **Stats.** The file's `+N −N` and GitHub's five squares, the share of added and removed lines.
 
 ### Editing in place
@@ -77,7 +77,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 
 ### In sync with the disk
 
-- **Not only Edit and Write.** Notebook edits show like any other. In a git repository, files a shell command of Claude's changes show too: against HEAD, as new, or against the text before the command when they already had changes.
+- **Not only Edit and Write.** Notebook edits show like any other. Files a shell command of Claude's changes show too: in a git repository the ones `git status` lists, against HEAD, as new, or against the text before the command when they already had changes; and, git or no git, the files the command names (`sed -i … notes.md`, a script's `Path("system.md")`, `$S/out.md` with `S=` set in the command), so a file git ignores or one outside the repository shows as well.
 - Changes made in another editor, by git or by a script show up within a second.
 - A file changed back to how it was before Claude drops off the list.
 - If a file changes on disk while you have unsaved edits in it, the panel asks whether to **Take the disk version** or **Keep mine**.
@@ -138,9 +138,9 @@ The editor takes the keys once you click in it.
 ## How it works
 
 - The mod wraps Claude's Edit, Write and NotebookEdit tool calls. Before the first edit of a file it keeps the file's text: the session-start base, until the list is cleared. Before the first edit of a file in each turn it keeps the text again: the last-turn base.
-- Around each Bash call in a git repository it asks `git status` which files are changed, before and after. A file the command changed is listed, against the text it had before the command if it already had changes, else against HEAD (or as new when untracked). Files over 1 MB, binary files and deletions are left out.
+- Around each Bash call in a git repository it asks `git status` which files are changed, before and after. A file the command changed is listed, against the text it had before the command if it already had changes, else against HEAD (or as new when untracked). It also reads the files the command names, up to 64 paths, from the working folder and each folder the command `cd`s to, with `~` and the command's own `VAR=` values filled in, and lists those that changed or appeared. Files over 1 MB, binary files and deletions are left out.
 - The diff is Myers' algorithm, the one git uses; a very large one is first split on lines found once on each side.
-- A file too large to hand to the editor whole goes to it a part at a time; an edit in the part is put back in its place in the whole text.
+- A file too large to hand to the editor whole goes to it as its hunks, end to end; an edit in them is put back in its place in the whole text.
 - **Git HEAD** reads the committed file with `git cat-file blob HEAD:<file>`, again every few seconds so a commit shows up. A file not yet committed compares with an empty one.
 - Review comments go to Claude as a user message.
 - Every second it checks the tracked files' size and modification time and reads any that changed.
@@ -153,7 +153,7 @@ The editor takes the keys once you click in it.
 The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built or downloaded.
 
 - **Network:** none.
-- **Reads** the files Claude edits or writes, before and after each edit, and checks their size and modification time every second. Around a shell command in a git repository it reads the files git lists as changed (up to 2,000 files of 1 MB each).
+- **Reads** the files Claude edits or writes, before and after each edit, and checks their size and modification time every second. Around a shell command it reads the files git lists as changed (up to 2,000 files of 1 MB each) and the files the command names (up to 64), and the `HOME` variable to place `~`.
 - **Writes** a file only when you press **Save**, **Save all** or Cmd/Ctrl+S, and only a file on the list. Besides, it writes its own store (below).
 - **Runs** a program only for **Compare with: Git HEAD**, around Claude's shell commands and for **Open in editor**, with fixed arguments and no shell:
   - `git -C <folder> rev-parse` and `git -C <folder> cat-file blob HEAD:./<file>`, which only read: no hook, filter or pager runs;
@@ -167,9 +167,9 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 ## Limitations
 
 - Editing works in the terminal and the desktop app; the mobile app shows the diff read-only.
-- Shell commands are tracked only in a git repository and only when they finish before Claude goes on: not those run in the background. Files they delete are not listed.
+- Shell commands are tracked only when they finish before Claude goes on: not those run in the background. Outside what `git status` lists, a file shows only when the command names it: one a script or a glob reaches by itself does not. Files they delete are not listed.
 - A single line too long to hand to the editor (about 90,000 characters) has to be edited elsewhere: **Open in editor**.
-- A surface draws a limited tree, so the editor draws about 100 changed lines of a diff at a time, with their context, fewer for long lines. If a surface still cannot draw them, the editor tries again with half as many.
+- A surface draws a limited tree (100,000 characters for one editor), so a diff of more than about 200 rows, fewer for long lines, is drawn a part at a time, cut only between change blocks, and scrolls by half a part. If a surface still cannot draw a part, the editor tries again with half as much.
 - Keys go to the editor only after a click in it, and some hosts keep F7 or Cmd+F for themselves: the buttons do the same.
 - The list comes back only in the session that made it, resumed: `/clear` or a new session starts an empty one. A file whose saved text the store could not take is left out, and the panel says so.
 - A diff past ten million steps of work, rare outside generated files, is drawn as one removed block followed by one added block.
@@ -204,7 +204,7 @@ The type definitions in `.claude-plugin/types/` are generated by Claude Code whe
 | `hooks/editor.tsx` | The diff editor: layout, input, drawing |
 | `hooks/files.tsx` | The changed files list |
 | `hooks/diff.ts` | Line diff, word ranges, patches |
-| `hooks/window.ts` | The parts of a file too large for the editor |
+| `hooks/window.ts` | The hunks, or parts, of a file too large for the editor |
 | `hooks/highlight.ts` | Syntax highlighting |
 | `types/index.d.ts` | The mod's state types |
 

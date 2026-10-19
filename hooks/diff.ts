@@ -8,7 +8,7 @@ export type Row = { kind: RowKind; text: string; oldNo: number; newNo: number }
 /** Lines of text vs base, one patch hunk: at text line `at`, `del` text lines stand for the base lines `ins`. */
 export type Patch = [at: number, del: number, ins: string[]][]
 
-export const CONTEXT = 5
+export const CONTEXT = 3
 
 /** Regions past this many line pairs split at their unique lines before Myers runs. */
 const PATIENCE_CELLS = 1_000_000
@@ -300,6 +300,28 @@ export function changeBlocks(rows: readonly Row[]): [number, number][] {
     const start = k
     while (k + 1 < rows.length && rows[k + 1]!.kind !== 'ctx') k++
     out.push([start, k + 1])
+  }
+
+  return out
+}
+
+/**
+ * The hunks: each change block with CONTEXT rows around it, as row ranges
+ * [start, end). Blocks this close share a hunk, unless a break lies between:
+ * a row that starts after a stretch of the file left out.
+ */
+export function hunksOf(rows: readonly Row[], breaks: readonly number[] = []): [number, number][] {
+  const out: [number, number][] = []
+  const at = breaks.slice().sort((a, b) => a - b)
+  let floor = 0
+  let n = 0
+  for (const [s, e] of changeBlocks(rows)) {
+    while (n < at.length && at[n]! <= s) floor = at[n++]!
+    const from = Math.max(floor, s - CONTEXT)
+    const to = Math.min(n < at.length ? at[n]! : rows.length, e + CONTEXT)
+    const last = out[out.length - 1]
+    if (last && last[0] >= floor && from <= last[1]) last[1] = Math.max(last[1], to)
+    else out.push([from, to])
   }
 
   return out

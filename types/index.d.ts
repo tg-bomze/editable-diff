@@ -57,6 +57,8 @@ export type Counters = {
   commentSeq: number
   edgeSeq: number
   revealSeq: number
+  /** A click on lines left out of a file by parts: bring them in. */
+  expandSeq: number
 }
 
 /** Unsaved edits, by absolute path: the editor's whole text. */
@@ -77,17 +79,34 @@ export type EditorPost = Counters & {
   edge: 1 | -1
   /** The last command acted on. */
   cmdSeq: number
+  /** By pieces: where each stretch left out between two pieces now falls in `text`, as a line index. */
+  cuts: number[]
+  /** The stretch the last expand click asked for: 0 before the first piece, k before piece k, the piece count after the last. */
+  expand: number
 }
 
-/**
- * The part of a file too large to hand over whole that its editor holds: text
- * lines [line, line + lines), base lines [baseLine, baseLine + baseLines).
- */
-export type FileWindow = {
+/** Text lines [line, line + lines) of a file, and base lines [baseLine, baseLine + baseLines). */
+export type Piece = {
   line: number
   lines: number
   baseLine: number
   baseLines: number
+}
+
+/**
+ * What the editor of a file too large to hand over whole holds: its hunks,
+ * as pieces with the unchanged stretches between them left out; or, the whole
+ * file shown, one contiguous part.
+ */
+export type FileWindow = {
+  pieces: Piece[]
+  /** One contiguous part of the whole file, not hunks. */
+  isWhole: boolean
+  /** Changes lie before the first piece, or after the last, that the window does not hold. */
+  before: boolean
+  after: boolean
+  /** Bumped whenever the pieces are cut or moved other than by the editor's own edits: a new editor instance. */
+  seq: number
   /** The file's `rev` and the base it was cut for: either changing cuts it afresh. */
   rev: number
   baseKey: string

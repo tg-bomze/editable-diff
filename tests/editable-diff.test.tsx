@@ -241,13 +241,31 @@ test('a large diff shows 100 rows at a time and the window moves by 50', async (
   // Rows: -x, +L1 … +L300, then the trailing empty line; the first 100 are drawn.
   expect(await line(ui, / L99$/)).toBeDefined()
   expect(await line(ui, / L100$/)).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /Show next 50 lines/, in: 'file-1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Show next 50 changed lines/, in: 'file-1' })).toBeDefined()
 
   await ui.pointer({ type: 'down', x: 10, y: 100, button: 'left', in: 'file-1' })
-  expect(await ui.find({ type: 'Text', text: /Show previous 50 lines/, in: 'file-1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Show previous 50 changed lines/, in: 'file-1' })).toBeDefined()
   expect(await line(ui, / L49$/)).toBeUndefined()
   expect(await line(ui, / L50$/)).toBeDefined()
   expect(await line(ui, / L149$/)).toBeDefined()
+  await ui.unmount()
+})
+
+test('the window counts changed lines: unchanged ones around them come along', async ($, on) => {
+  const old = Array.from({ length: 180 }, (_, i) => `l${i}`).join('\n')
+  world(on, { [FILE]: `${old}\n` })
+  // 9 changes, each with 10 unchanged lines around it: 108 rows, 18 of them changed.
+  await claudeEdits(
+    $,
+    old,
+    old.replace(/^l(\d*0)$/gm, (all, n: string) => (Number(n) % 20 === 10 ? `X${n}` : all)),
+  )
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect(await line(ui, / X10$/)).toBeDefined()
+  expect(await line(ui, / X170$/)).toBeDefined()
+  expect(await line(ui, / l175$/)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -354,6 +372,25 @@ test('long changed lines: the window stops short of the tree bounds, and Show ne
   const after = await shown()
   // The window moved on to the row right after the last one drawn: none skipped.
   expect(after[0]).toBe(`value${Number(/\d+/.exec(last)![0]) + 1} `)
+  await ui.unmount()
+})
+
+test('long lines near the end: Show next reaches the last line', async ($, on) => {
+  const line = (i: number) =>
+    `    const value${i} = await someFunction(argumentNumberOne, argumentNumberTwo, "string literal ${i}") // c`
+  const old = Array.from({ length: 120 }, (_, i) => line(i)).join('\n')
+  world(on, { [FILE]: `${old}\n` })
+  await claudeEdits($, old, old.replace(/value/g, 'VALUE'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.resize({ columns: 90, rows: 40, in: 'file-1' })
+
+  for (let n = 0; n < 20 && (await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })); n++) {
+    const nextRow =
+      (await ui.findAll({ type: 'Box', in: 'file-1' })).filter(b => /^[lwg]\d+$/.test(b.key ?? '')).length - 1
+    await ui.pointer({ type: 'down', x: 10, y: nextRow, button: 'left', in: 'file-1' })
+  }
+  expect(await ui.find({ type: 'Text', text: /Show next/, in: 'file-1' })).toBeUndefined()
+  expect((await lines(ui)).some(l => l.text.includes('VALUE119 '))).toBe(true)
   await ui.unmount()
 })
 

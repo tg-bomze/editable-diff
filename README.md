@@ -51,7 +51,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
   - **Last turn**: the file as Claude's last turn found it, so only what that turn did shows. A file the last turn did not touch says so.
   - **Git HEAD**: the file as committed. A file not yet committed compares with an empty one; outside a git repository the panel says so and uses the session start.
 - **Long lines wrap** to the width of the panel instead of running off its edge.
-- **Large diffs stay fast.** About 100 lines are drawn at a time, fewer when the lines are long. **Show next 50 lines** / **Show previous 50 lines** move the window, and so does the cursor.
+- **Large diffs stay fast.** About 100 changed lines are drawn at a time, with the unchanged lines around them, fewer when the lines are long. **Show next 50 changed lines** / **Show previous 50 changed lines** move the window, and so does the cursor.
 - **Large files by parts.** A file too large to hand to the editor whole (about 90,000 characters with its diff) is edited a part at a time, around its first change: **Lines 1–2000 of 12000**, with **↑ Earlier part** / **↓ Later part**, and F7 moves on to the part with the next change. Line numbers are the file's, and Save writes the whole file.
 - **Stats.** The file's `+N −N` and GitHub's five squares, the share of added and removed lines.
 
@@ -169,7 +169,7 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 - Editing works in the terminal and the desktop app; the mobile app shows the diff read-only.
 - Shell commands are tracked only in a git repository and only when they finish before Claude goes on: not those run in the background. Files they delete are not listed.
 - A single line too long to hand to the editor (about 90,000 characters) has to be edited elsewhere: **Open in editor**.
-- A surface draws a limited tree, so the editor draws about 100 rows of a diff at a time, fewer for long lines. If a surface still cannot draw them, the editor tries again with half as many.
+- A surface draws a limited tree, so the editor draws about 100 changed lines of a diff at a time, with their context, fewer for long lines. If a surface still cannot draw them, the editor tries again with half as many.
 - Keys go to the editor only after a click in it, and some hosts keep F7 or Cmd+F for themselves: the buttons do the same.
 - The list comes back only in the session that made it, resumed: `/clear` or a new session starts an empty one. A file whose saved text the store could not take is left out, and the panel says so.
 - A diff past ten million steps of work, rare outside generated files, is drawn as one removed block followed by one added block.

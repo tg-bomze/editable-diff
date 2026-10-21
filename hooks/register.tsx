@@ -469,14 +469,12 @@ async function record(
   if (!cwd) cwd = await $.session.cwd()
 
   const hasDraft = (await read($, drafts))[path] !== undefined
-  let wasEmpty = false
   let id = 0
   if (!known) {
     id = await read($, nextId)
     await update($, nextId, n => n + 1)
   }
   await update($, files, list => {
-    wasEmpty = list.length === 0
     const old = list.find(f => f.path === path)
     const rest = list.filter(f => f.path !== path)
     const file: TrackedFile = old
@@ -508,7 +506,6 @@ async function record(
     return [file, ...rest]
   })
   if (!known && (await read($, baseMode)) === 'head') await refreshHeads($, path)
-  if (wasEmpty) void openPane($)
 }
 
 // Changes made outside the pane (another editor, git, a script): take them in.

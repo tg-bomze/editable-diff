@@ -92,7 +92,7 @@ Syntax colours cover JavaScript/TypeScript, Python, Go, Rust, C/C++/Java/C#/Swif
 
 ## Usage
 
-The panel, titled **Claude's edits**, opens by itself when Claude first edits a file. Reopen it with `/editable-diff` or **Open panel** above the prompt.
+The panel, titled **Claude's edits**, opens only when you ask: with **Open panel** on the line above the prompt, which shows once Claude has changed a file, or with `/editable-diff`.
 
 | Action | How |
 | --- | --- |

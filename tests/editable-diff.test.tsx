@@ -280,6 +280,33 @@ test('code is coloured by its language', async ($, on) => {
   await ui.unmount()
 })
 
+test('an edit shows the band above the prompt and leaves the panel closed until Open panel', async ($, on) => {
+  world(on, { [FILE]: 'x\n' })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine-band" />
+  })
+  await claudeEdits($, 'x', 'y')
+  const band = await $.ui.mount({
+    plugin: 'editable-diff',
+    component: 'AbovePrompt',
+    props: {
+      hasSurvey: false,
+      isWorking: false,
+      maxRows: 10,
+      bodyColumns: 100,
+      scroll: { offset: 0, bodyRows: 10 },
+      view: {},
+    },
+    surface: 'desktop',
+  })
+  // The panel could open (there is room), yet it waits: the band shows while it is closed.
+  expect(await band.find({ type: 'Text', text: /^● Claude's edits · 1 file$/ })).toBeDefined()
+  await band.press({ key: 'open-pane' })
+  expect(await band.find({ type: 'Text', text: /Claude's edits/ })).toBeUndefined()
+  await band.unmount()
+})
+
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`${surface}: the band above the prompt clears the list, asking first over unsaved edits`, async ($, on) => {
     // No room for the pane on this surface: the band stands in for it.

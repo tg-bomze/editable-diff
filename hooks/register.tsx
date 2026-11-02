@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Color, EngineInterface, Register } from 'claude-code'
+import type { Color, EngineInterface, Register, RenderElement } from 'claude-code'
 
 import type {
   BaseMode,
@@ -1079,18 +1079,27 @@ export const register: Register = on => {
     if (e.props.hasSurvey || list.length === 0 || (await read($, isPaneOpen))) return next(e)
     const dirty = Object.keys(await read($, drafts)).length
     const { Box, Text, Button } = $.ui.resolve(e)
+    // The band is one for every plugin: what the hooks beneath draw (another
+    // mod's band) stays, and this line goes under it.
+    const beneath = await next(e)
+    const stacked = (line: RenderElement) => (
+      <Box flexDirection="column">
+        {beneath}
+        {line}
+      </Box>
+    )
 
     if (await read($, isConfirmingClear)) {
-      return (
+      return stacked(
         <Box flexDirection="row" gap={1} alignItems="center">
           <Text color="warning">Unsaved edits in {fileCount(dirty)} will be lost. Files on disk stay as they are.</Text>
           <Button key="band-clear-yes" label="Clear" variant="primary" onPress={() => clearAll($)} />
           <Button key="band-clear-no" label="Cancel" onPress={() => update($, isConfirmingClear, () => false)} />
-        </Box>
+        </Box>,
       )
     }
 
-    return (
+    return stacked(
       <Box flexDirection="row" gap={1} alignItems="center">
         <Text>
           <Text color="claude">●</Text> <Text weight="semibold">Claude's edits</Text>
@@ -1099,7 +1108,7 @@ export const register: Register = on => {
         </Text>
         <Button key="open-pane" label="Open panel" variant="secondary" onPress={() => void openPane($)} />
         <Button key="band-clear" label="Clear these diffs" variant="secondary" onPress={() => askClear($)} />
-      </Box>
+      </Box>,
     )
   })
 

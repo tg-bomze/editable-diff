@@ -302,6 +302,8 @@ test('an edit shows the band above the prompt and leaves the panel closed until 
   })
   // The panel could open (there is room), yet it waits: the band shows while it is closed.
   expect(await band.find({ type: 'Text', text: /^● Claude's edits · 1 file$/ })).toBeDefined()
+  // What the hooks beneath drew stays beside it.
+  expect(await band.find({ key: 'engine-band' })).toBeDefined()
   await band.press({ key: 'open-pane' })
   expect(await band.find({ type: 'Text', text: /Claude's edits/ })).toBeUndefined()
   await band.unmount()

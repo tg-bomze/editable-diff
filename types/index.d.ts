@@ -155,6 +155,10 @@ declare module 'claude-code' {
       /** The file shown in the pane (picked in the list); the first file when it names none. */
       active: string
       isPaneOpen: boolean
+      /** On in every chat: off after /diff-off. */
+      isEnabled: boolean
+      /** On in this chat: off after /diff-chat-off. */
+      isChatEnabled: boolean
       baseMode: BaseMode
       /** Claude's current or last turn on the main loop that began with a prompt. */
       turnId: string

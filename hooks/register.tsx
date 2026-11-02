@@ -71,6 +71,8 @@ const isConfirmingClear = atom({ plugin: 'editable-diff', key: 'isConfirmingClea
 const seen = atom({ plugin: 'editable-diff', key: 'seen' } as const, {})
 const active = atom({ plugin: 'editable-diff', key: 'active' } as const, '')
 const isPaneOpen = atom({ plugin: 'editable-diff', key: 'isPaneOpen' } as const, false)
+const isEnabled = atom({ plugin: 'editable-diff', key: 'isEnabled' } as const, true)
+const isChatEnabled = atom({ plugin: 'editable-diff', key: 'isChatEnabled' } as const, true)
 const baseMode = atom({ plugin: 'editable-diff', key: 'baseMode' } as const, 'session')
 const turnId = atom({ plugin: 'editable-diff', key: 'turnId' } as const, '')
 const isSplit = atom({ plugin: 'editable-diff', key: 'isSplit' } as const, false)
@@ -917,13 +919,89 @@ async function openInEditor($: EngineInterface, path: string, line: number): Pro
   $.ui.toast('Could not find an editor to open the file in')
 }
 
+// What draws nothing of a plugin's: no node, an empty string, the engine's
+// own drawing (`{ type: 'engine' }`, empty unless a survey holds the band), or
+// a Box or Text holding only such. No gap goes above that.
+const isBlank = (node: unknown): boolean => {
+  if (node === undefined || node === null || node === false) return true
+  if (typeof node === 'string') return node.trim() === ''
+  if (typeof node !== 'object') return false
+  const { type, children } = node as { type?: unknown; children?: unknown[] }
+  if (type === 'engine') return true
+
+  return (type === 'Box' || type === 'Text') && (children ?? []).every(isBlank)
+}
+
+// On or off: `enabled` in $.store for every chat (on unless turned off), and
+// `chat:<session id>` set to false for a chat turned off alone. The band and
+// the panel show where it is on everywhere and not turned off in that chat;
+// Claude's edits are tracked either way, so turning it on shows them all.
+const chatKey = async ($: EngineInterface) => `chat:${await $.session.id()}`
+
+const isShown = async ($: EngineInterface) => (await read($, isEnabled)) && (await read($, isChatEnabled))
+
+const loadSwitches = async ($: EngineInterface) => {
+  const everywhere = (await $.store.get('enabled').catch(() => undefined)) !== false
+  const here =
+    (await chatKey($)
+      .then(key => $.store.get(key))
+      .catch(() => undefined)) !== false
+  await update($, isEnabled, () => everywhere)
+  await update($, isChatEnabled, () => here)
+
+  return everywhere && here
+}
+
+const hide = async ($: EngineInterface) => {
+  await update($, isConfirmingClear, () => false)
+  if (await read($, isPaneOpen)) {
+    await $.ui.close({ id: PANE }).catch(() => {})
+    await update($, isPaneOpen, () => false)
+  }
+}
+
+type Switch = 'diff-on' | 'diff-off' | 'diff-chat-on' | 'diff-chat-off'
+
+const SWITCHES: { name: Switch; description: string }[] = [
+  { name: 'diff-on', description: "Show Claude's edits above the prompt in every chat" },
+  { name: 'diff-off', description: "Hide Claude's edits in every chat" },
+  { name: 'diff-chat-on', description: "Show Claude's edits in this chat" },
+  { name: 'diff-chat-off', description: "Hide Claude's edits in this chat only" },
+]
+
+const runSwitch = async ($: EngineInterface, name: Switch) => {
+  const key = await chatKey($)
+  if (name === 'diff-on') {
+    await $.store.set('enabled', true)
+    await $.store.delete(key)
+    await loadSwitches($)
+
+    return 'Editable diff is on in every chat, except chats turned off with /diff-chat-off.'
+  }
+  if (name === 'diff-off') {
+    await $.store.set('enabled', false)
+    await loadSwitches($)
+    await hide($)
+
+    return 'Editable diff is off in every chat. /diff-on turns it back on.'
+  }
+  if (name === 'diff-chat-on') {
+    await $.store.delete(key)
+
+    return (await loadSwitches($))
+      ? 'Editable diff is on in this chat.'
+      : 'Editable diff is off in every chat; /diff-on turns it on everywhere.'
+  }
+  await $.store.set(key, false)
+  await loadSwitches($)
+  await hide($)
+
+  return 'Editable diff is off in this chat. /diff-chat-on turns it back on here.'
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
-    await $.command.register({
-      name: 'editable-diff',
-      description: "Open the panel with Claude's edits: diff, edit in place, save",
-    })
     const isUp = (await $.ui.panes()).some(p => p.id === PANE)
     await update($, isPaneOpen, () => isUp)
     await update($, seen, () => ({}))
@@ -931,6 +1009,10 @@ export const register: Register = on => {
     sessionId = await $.session.id().catch(() => '')
     if (sessionId && (await read($, files)).length === 0) await restore($).catch(() => {})
     $.clock.every(POLL_MS, () => void poll($).catch(() => {}))
+    for (const command of SWITCHES) await $.command.register({ ...command, immediate: true })
+    await loadSwitches($)
+    // Another chat's /diff-on or /diff-off reaches this one within seconds.
+    $.clock.every(3000, () => void loadSwitches($).then(isOn => (isOn ? undefined : hide($))))
 
     return next(e)
   })
@@ -941,11 +1023,9 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'editable-diff' }, async $ => {
-    const { isPlaced } = await openPane($)
-
-    return { text: isPlaced ? 'The edits panel is open.' : 'The edits panel opens once there is room for it.' }
-  })
+  for (const { name } of SWITCHES) {
+    on('command.run', { command: name }, async $ => ({ text: await runSwitch($, name) }))
+  }
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
     await update($, isPaneOpen, () => false)
@@ -1076,14 +1156,14 @@ export const register: Register = on => {
   // Above the prompt while the pane is closed: open it again, or clear the list.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, files)
-    if (e.props.hasSurvey || list.length === 0 || (await read($, isPaneOpen))) return next(e)
+    if (e.props.hasSurvey || list.length === 0 || (await read($, isPaneOpen)) || !(await isShown($))) return next(e)
     const dirty = Object.keys(await read($, drafts)).length
     const { Box, Text, Button } = $.ui.resolve(e)
     // The band is one for every plugin: what the hooks beneath draw (another
     // mod's band) stays, and this line goes under it.
     const beneath = await next(e)
     const stacked = (line: RenderElement) => (
-      <Box flexDirection="column">
+      <Box flexDirection="column" rowGap={isBlank(beneath) ? 0 : 'lg'}>
         {beneath}
         {line}
       </Box>

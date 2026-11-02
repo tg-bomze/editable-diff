@@ -26,7 +26,7 @@ In the desktop app: **+** next to the prompt → **Plugins** → **Add marketpla
 
 ### The panel
 
-- **Opens by itself** on Claude's first edit of the session, titled **Claude's edits**. Reopen it with `/editable-diff`.
+- **Opens when you ask**, with **Open panel** on the line above the prompt, titled **Claude's edits**.
 - **A line above the prompt** while the panel is closed: `● Claude's edits · N files`, with **Open panel** and **Clear these diffs**, and a count of files with unsaved edits.
 - **Toolbar.** The number of changed files, a chip with the number of unsaved ones, **Save all** when more than one file has unsaved edits, and **Clear these diffs** to empty the list. It asks first when unsaved edits would be lost, and never touches the files on disk.
 - **Follows the theme.** The palette follows the light or dark theme set in Claude Code.
@@ -92,7 +92,7 @@ Syntax colours cover JavaScript/TypeScript, Python, Go, Rust, C/C++/Java/C#/Swif
 
 ## Usage
 
-The panel, titled **Claude's edits**, opens only when you ask: with **Open panel** on the line above the prompt, which shows once Claude has changed a file, or with `/editable-diff`.
+The panel, titled **Claude's edits**, opens only when you ask: with **Open panel** on the line above the prompt, which shows once Claude has changed a file.
 
 | Action | How |
 | --- | --- |
@@ -114,6 +114,17 @@ The panel, titled **Claude's edits**, opens only when you ask: with **Open panel
 | Forget every file | **Clear these diffs** (asks first if there are unsaved edits) |
 
 Nothing is written to disk until you save. Removing or clearing only empties the list; files on disk stay as they are.
+
+### Turning it off
+
+| Command | Does |
+| --- | --- |
+| `/diff-off` | Hides the line above the prompt and closes the panel in every chat, open ones included |
+| `/diff-on` | Shows them again in every chat, and in this chat even if `/diff-chat-off` hid them here |
+| `/diff-chat-off` | Hides them in this chat only, and they stay hidden when the chat is reopened |
+| `/diff-chat-on` | Shows them again in this chat |
+
+While it is off, Claude's edits are still tracked, so turning it back on shows every file changed in the meantime. A new chat starts with it on.
 
 ### Keys in the editor
 
@@ -162,7 +173,7 @@ The mod is plain TypeScript in `hooks/`, with no dependencies and nothing built 
 - **Tells Claude** only what you send: a note that you saved a file, so it reads the file again, and your review comments when you press **Send to Claude** or **Put in prompt**. Quoted lines sit in a code fence their own text cannot close.
 - **Copies** to the clipboard only on Cmd/Ctrl+C or X.
 - **Shows** what text hides: control characters, zero-width spaces and bidirectional overrides ("Trojan Source") draw as `·` or `�`, in the diff and in file names.
-- **Keeps** each session's list in the mod's store, a JSON file Claude Code keeps for it in your Claude configuration folder: the paths, each file's text before Claude's edits (and at the start of the last turn, when that differs), your unsaved edits, review comments and viewed marks, and the panel's settings. Not the files' current text: that is read again from disk. The 20 most recent sessions are kept, within 3.5 MB; **Clear these diffs** removes a session's entry.
+- **Keeps** each session's list in the mod's store, a JSON file Claude Code keeps for it in your Claude configuration folder: the paths, each file's text before Claude's edits (and at the start of the last turn, when that differs), your unsaved edits, review comments and viewed marks, and the panel's settings. Not the files' current text: that is read again from disk. The 20 most recent sessions are kept, within 3.5 MB; **Clear these diffs** removes a session's entry. The on/off switches live there too, a chat turned off with `/diff-chat-off` by its session id.
 
 ## Limitations
 

@@ -282,9 +282,14 @@ test('code is coloured by its language', async ($, on) => {
 
 test('an edit shows the band above the prompt and leaves the panel closed until Open panel', async ($, on) => {
   world(on, { [FILE]: 'x\n' })
+  // Beneath the mod: another mod's band.
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box key="engine-band" />
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box key="other-band">
+        <Text>🎙</Text>
+      </Box>
+    )
   })
   await claudeEdits($, 'x', 'y')
   const band = await $.ui.mount({
@@ -303,7 +308,7 @@ test('an edit shows the band above the prompt and leaves the panel closed until 
   // The panel could open (there is room), yet it waits: the band shows while it is closed.
   expect(await band.find({ type: 'Text', text: /^● Claude's edits · 1 file$/ })).toBeDefined()
   // What the hooks beneath drew stays beside it.
-  expect(await band.find({ key: 'engine-band' })).toBeDefined()
+  expect(await band.find({ key: 'other-band' })).toBeDefined()
   await band.press({ key: 'open-pane' })
   expect(await band.find({ type: 'Text', text: /Claude's edits/ })).toBeUndefined()
   await band.unmount()
@@ -1096,4 +1101,102 @@ test('a file with a long folder keeps to one row of the list, so a click picks t
   await ui.pointer({ type: 'down', x: 2, y: 0, button: 'left', in: 'files' })
   expect(await ui.find({ type: 'Client', key: 'file-1' })).toBeDefined()
   await ui.unmount()
+})
+
+// A slash command the person typed, bare.
+const typed = (command: string) => ({
+  command,
+  args: '',
+  origin: { kind: 'composer' as const },
+  presentation: { isFullscreen: false, columns: 80 },
+})
+
+const BAND = {
+  plugin: 'editable-diff',
+  component: 'AbovePrompt',
+  props: {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 10,
+    bodyColumns: 100,
+    scroll: { offset: 0, bodyRows: 10 },
+    view: {},
+  },
+} as const
+
+test('no gap goes above the engine’s empty band', async ($, on) => {
+  world(on, { [FILE]: 'x\n' })
+  // The engine hands its own drawing on as a reference.
+  on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'engine', ref: 1 }) as never)
+  await claudeEdits($, 'x', 'y')
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ type: 'Text', text: /^● Claude's edits · 1 file$/ })).toBeDefined()
+  expect((await band.findAll({ type: 'Box' })).some(box => box.props.rowGap === 'lg')).toBe(false)
+  await band.unmount()
+})
+
+test('/diff-chat-off hides the band in this chat alone, /diff-chat-on brings it back', async ($, on) => {
+  world(on, { [FILE]: 'x\n' })
+  const store = memoryStore(on)
+  let chat = 'chat-a'
+  on('session.id', () => ({ value: chat }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>beneath</Text>
+  })
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  await claudeEdits($, 'x', 'y')
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ key: 'open-pane' })).toBeDefined()
+
+  const off = await $.command.run(typed('diff-chat-off'))
+  expect(off.text).toContain('off in this chat')
+  expect(store.get('chat:chat-a')).toBe(false)
+  expect(await band.find({ key: 'open-pane' })).toBeUndefined()
+  expect(await band.find({ type: 'Text', text: 'beneath' })).toBeDefined()
+
+  // Another chat still shows it.
+  chat = 'chat-b'
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  expect(await band.find({ key: 'open-pane' })).toBeDefined()
+
+  chat = 'chat-a'
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  expect(await band.find({ key: 'open-pane' })).toBeUndefined()
+  await $.command.run(typed('diff-chat-on'))
+  expect(store.get('chat:chat-a')).toBeUndefined()
+  expect(await band.find({ key: 'open-pane' })).toBeDefined()
+  await band.unmount()
+})
+
+test('/diff-off closes the panel and hides the band everywhere until /diff-on', async ($, on) => {
+  world(on, { [FILE]: 'x\n' })
+  const store = memoryStore(on)
+  on('session.id', () => ({ value: 'chat-a' }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+  const closed: string[] = []
+  on('ui.close', ($, e) => {
+    closed.push(e.id)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  await claudeEdits($, 'x', 'y')
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'open-pane' })
+
+  const off = await $.command.run(typed('diff-off'))
+  expect(off.text).toContain('off in every chat')
+  expect(store.get('enabled')).toBe(false)
+  expect(closed).toEqual(['editable-diff'])
+  expect(await band.find({ key: 'open-pane' })).toBeUndefined()
+
+  const chatOn = await $.command.run(typed('diff-chat-on'))
+  expect(chatOn.text).toContain('off in every chat')
+  await $.command.run(typed('diff-on'))
+  expect(store.get('enabled')).toBe(true)
+  expect(await band.find({ key: 'open-pane' })).toBeDefined()
+  await band.unmount()
 })
